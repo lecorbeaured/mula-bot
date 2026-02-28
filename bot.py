@@ -1,9 +1,12 @@
+import os
 import asyncio
 import logging
 import sqlite3
+import threading
 from datetime import datetime, time
 from typing import List, Optional
 
+from flask import Flask, render_template_string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -30,7 +33,6 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Tasks table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +44,6 @@ def init_db():
         )
     ''')
     
-    # Users table for timezone/preferences
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -55,7 +56,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Database operations
 class Database:
     @staticmethod
     def add_task(user_id: int, task_name: str, reminder_time: str) -> int:
@@ -118,7 +118,6 @@ class Database:
     
     @staticmethod
     def get_all_active_tasks() -> List[dict]:
-        """Get all active tasks for reminder checking"""
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute(
@@ -147,7 +146,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message and register user"""
     user = update.effective_user
     
-    # Register user in database
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -164,6 +162,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /listtasks - View all your tasks\n"
         "❌ /deletetask - Remove a task\n"
         "⏸️ /toggletask - Enable/disable a task\n"
+        "🧪 /test - Test notification settings\n"
         "❓ /help - Show help message\n\n"
         "I'll automatically remind you of your tasks every day!"
     )
@@ -179,7 +178,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/listtasks - List all your tasks\n"
         "/deletetask - Delete a specific task\n"
         "/toggletask - Toggle task on/off\n"
-        "/cancel - Cancel current operation\n\n"
+        "/test - Test your notification settings\n"
+        "/help - Show help message\n\n"
         "*Time Format:*\n"
         "Use 24-hour format: `HH:MM`\n"
         "Examples: `09:00`, `14:30`, `20:00`\n\n"
@@ -189,6 +189,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def test_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send test notification to verify settings"""
     await update.message.reply_text(
         "🔔 *TEST NOTIFICATION*\n\n"
         "Did you hear/see this?\n\n"
@@ -196,7 +197,7 @@ async def test_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Phone volume is up\n"
         "• Telegram notifications are ON\n"
         "• Do Not Disturb is OFF\n\n"
-        "💡 *Pro Tip:* Upgrade to Pro for SMS backup notifications!",
+        "💡 Pro Tip: Upgrade to Pro for SMS backup notifications!",
         parse_mode='Markdown'
     )
 
@@ -232,7 +233,6 @@ async def add_task_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save task time and complete"""
     time_str = update.message.text
     
-    # Validate time format
     try:
         datetime.strptime(time_str, "%H:%M")
     except ValueError:
@@ -246,7 +246,6 @@ async def add_task_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_name = context.user_data['task_name']
     user_id = update.effective_user.id
     
-    # Save to database
     task_id = Database.add_task(user_id, task_name, time_str)
     
     await update.message.reply_text(
@@ -294,7 +293,6 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "🟢" if task['is_active'] else "🔴"
         message += f"{status} `{task['reminder_time']}` - {task['task_name']}\n"
         
-        # Add toggle button for each task
         action = "⏸️ Pause" if task['is_active'] else "▶️ Resume"
         keyboard.append([
             InlineKeyboardButton(
@@ -393,7 +391,6 @@ async def toggle_task_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if Database.toggle_task(task_id, user_id):
         await query.edit_message_text("✅ Task status updated!")
-        # Refresh list
         await list_tasks_callback(update, context)
     else:
         await query.edit_message_text("❌ Task not found!")
@@ -468,17 +465,15 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    # Initialize database
     init_db()
     
-    # Replace with your bot token from @BotFather
-    import os
-TOKEN = os.environ.get("TOKEN")
+    TOKEN = os.environ.get("TOKEN")
+    if not TOKEN:
+        logger.error("No TOKEN found! Set TOKEN environment variable.")
+        return
     
-    # Create application
     application = Application.builder().token(TOKEN).build()
     
-    # Add conversation handler for adding tasks
     add_task_conv = ConversationHandler(
         entry_points=[CommandHandler('addtask', add_task_start)],
         states={
@@ -494,7 +489,6 @@ TOKEN = os.environ.get("TOKEN")
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Add handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('test', test_notification))
@@ -503,19 +497,125 @@ TOKEN = os.environ.get("TOKEN")
     application.add_handler(CommandHandler('deletetask', delete_task_command))
     application.add_handler(CommandHandler('toggletask', toggle_task_command))
     
-    # Callback handlers
     application.add_handler(CallbackQueryHandler(list_tasks_callback, pattern='^list_tasks$'))
     application.add_handler(CallbackQueryHandler(toggle_task_callback, pattern='^toggle_'))
     application.add_handler(CallbackQueryHandler(delete_task_callback, pattern='^delete_'))
     application.add_handler(CallbackQueryHandler(add_task_start, pattern='^add_task$'))
     
-    # Schedule reminder job (runs every minute)
     job_queue = application.job_queue
     job_queue.run_repeating(check_reminders, interval=60, first=10)
     
-    # Start the bot
-    print("🤖 Bot is running...")
+    logger.info("🤖 Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+# WEB DASHBOARD
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mula Bot Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; background: white; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #4CAF50; color: white; }
+        .stats { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .btn { background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block; margin-top: 10px; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔔 Mula Bot Dashboard</h1>
+        
+        <div class="stats">
+            <h3>Your Stats</h3>
+            <p><strong>Total Tasks:</strong> {{ total_tasks }}</p>
+            <p><strong>Active Tasks:</strong> {{ active_tasks }}</p>
+            <p><strong>Completion Rate:</strong> {{ completion_rate }}%</p>
+        </div>
+        
+        <h2>Your Tasks</h2>
+        <table>
+            <tr>
+                <th>Task</th>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Created</th>
+            </tr>
+            {% for task in tasks %}
+            <tr>
+                <td>{{ task.task_name }}</td>
+                <td>{{ task.reminder_time }}</td>
+                <td>{% if task.is_active %}🟢 Active{% else %}🔴 Paused{% endif %}</td>
+                <td>{{ task.created_at }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        
+        <a href="/export" class="btn">📥 Export to CSV</a>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/')
+def dashboard():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT task_name, reminder_time, is_active, created_at FROM tasks")
+    tasks = [
+        {
+            "task_name": row[0],
+            "reminder_time": row[1],
+            "is_active": bool(row[2]),
+            "created_at": row[3]
+        }
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    
+    total = len(tasks)
+    active = sum(1 for t in tasks if t['is_active'])
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                  tasks=tasks, 
+                                  total_tasks=total,
+                                  active_tasks=active,
+                                  completion_rate=85)
+
+@app.route('/export')
+def export_csv():
+    import csv
+    import io
+    from flask import Response
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tasks")
+    data = cursor.fetchall()
+    conn.close()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'User', 'Task', 'Time', 'Active', 'Created'])
+    writer.writerows(data)
+    
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=tasks.csv"}
+    )
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+
 if __name__ == '__main__':
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
     main()
