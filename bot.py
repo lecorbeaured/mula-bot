@@ -472,7 +472,8 @@ def main():
     init_db()
     
     # Replace with your bot token from @BotFather
-    TOKEN = "8797827539:AAES3htqZLRHPx9PiyCvJm-iDX8Y48-P4zQ"
+        import os
+TOKEN = os.environ.get("TOKEN")
     
     # Create application
     application = Application.builder().token(TOKEN).build()
