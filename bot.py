@@ -146,6 +146,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message and register user"""
     user = update.effective_user
     
+    # RESET ANY STUCK CONVERSATIONS
+    context.user_data.clear()
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
@@ -179,6 +182,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/deletetask - Delete a specific task\n"
         "/toggletask - Toggle task on/off\n"
         "/test - Test your notification settings\n"
+        "/cancel - Cancel current operation\n"
         "/help - Show help message\n\n"
         "*Time Format:*\n"
         "Use 24-hour format: `HH:MM`\n"
@@ -199,6 +203,14 @@ async def test_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Do Not Disturb is OFF\n\n"
         "💡 Pro Tip: Upgrade to Pro for SMS backup notifications!",
         parse_mode='Markdown'
+    )
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown commands"""
+    await update.message.reply_text(
+        "❓ I don't recognize that command.\n\n"
+        "Stuck? Type /cancel first, then try again.\n"
+        "Use /help to see all commands."
     )
 
 # Add Task Conversation
@@ -263,6 +275,7 @@ async def add_task_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel conversation"""
+    context.user_data.clear()
     await update.message.reply_text("❌ Operation cancelled.")
     return ConversationHandler.END
 
@@ -270,6 +283,7 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel from button"""
     query = update.callback_query
     await query.answer()
+    context.user_data.clear()
     await query.edit_message_text("❌ Operation cancelled.")
     return ConversationHandler.END
 
@@ -489,19 +503,25 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
+    # Add handlers - ORDER MATTERS! ConversationHandler last
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('test', test_notification))
-    application.add_handler(add_task_conv)
     application.add_handler(CommandHandler('listtasks', list_tasks))
     application.add_handler(CommandHandler('deletetask', delete_task_command))
     application.add_handler(CommandHandler('toggletask', toggle_task_command))
+    application.add_handler(add_task_conv)  # Must be last
     
+    # Callback handlers
     application.add_handler(CallbackQueryHandler(list_tasks_callback, pattern='^list_tasks$'))
     application.add_handler(CallbackQueryHandler(toggle_task_callback, pattern='^toggle_'))
     application.add_handler(CallbackQueryHandler(delete_task_callback, pattern='^delete_'))
     application.add_handler(CallbackQueryHandler(add_task_start, pattern='^add_task$'))
     
+    # Fallback for unknown commands
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    
+    # Schedule reminder job
     job_queue = application.job_queue
     job_queue.run_repeating(check_reminders, interval=60, first=10)
     
