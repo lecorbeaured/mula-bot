@@ -110,43 +110,123 @@ def get_friendly_name(actual_tz):
     return actual_tz
 
 def parse_natural_date(text, timezone_str):
-    """Parse natural language dates"""
-    settings = {
-        'TIMEZONE': timezone_str,
-        'RETURN_AS_TIMEZONE_AWARE': True,
-        'PREFER_DATES_FROM': 'future',
-        'RELATIVE_BASE': datetime.now()
-    }
+    """Simplified reliable parser"""
+    text_lower = text.lower()
+    now = datetime.now(pytz.timezone(timezone_str))
     
-    # Check for recurring keywords
-    recurring = any(word in text.lower() for word in ['every', 'daily', 'weekly', 'monthly', 'each'])
+    target_date = now
+    target_time = "09:00"
+    is_recurring = False
     
-    # Try to parse
-    parsed = dateparser.parse(text, settings=settings)
+    # Check for recurring
+    if any(word in text_lower for word in ['every', 'daily', 'each', 'weekly', 'monthly']):
+        is_recurring = True
     
-    if not parsed:
-        return None
+    # Parse date keywords
+    if 'tomorrow' in text_lower:
+        target_date = now + timedelta(days=1)
+    elif 'today' in text_lower:
+        target_date = now
+    elif 'next week' in text_lower:
+        target_date = now + timedelta(weeks=1)
+    elif 'in 2 days' in text_lower or 'in two days' in text_lower:
+        target_date = now + timedelta(days=2)
+    elif 'in 3 days' in text_lower:
+        target_date = now + timedelta(days=3)
+    elif 'next monday' in text_lower:
+        days_ahead = 0 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = now + timedelta(days=days_ahead)
+    elif 'next tuesday' in text_lower:
+        days_ahead = 1 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = now + timedelta(days=days_ahead)
+    elif 'next wednesday' in text_lower:
+        days_ahead = 2 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = now + timedelta(days=days_ahead)
+    elif 'next thursday' in text_lower:
+        days_ahead = 3 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = now + timedelta(days=days_ahead)
+    elif 'next friday' in text_lower:
+        days_ahead = 4 - now.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        target_date = now + timedelta(days=days_ahead)
+    else:
+        # Try dateparser for specific dates like "June 15, 2026"
+        settings = {
+            'TIMEZONE': timezone_str,
+            'RETURN_AS_TIMEZONE_AWARE': True,
+            'PREFER_DATES_FROM': 'future',
+        }
+        parsed = dateparser.parse(text, settings=settings)
+        if parsed:
+            target_date = parsed
+            target_time = parsed.strftime('%H:%M')
+            return {
+                'datetime': parsed,
+                'date': parsed.strftime('%Y-%m-%d'),
+                'time': target_time,
+                'is_recurring': is_recurring
+            }
+    
+    # Extract time with regex
+    time_patterns = [
+        r'(\d{1,2}):(\d{2})\s*(am|pm)',
+        r'(\d{1,2})\s*(am|pm)',
+        r'at\s+(\d{1,2}):(\d{2})',
+        r'at\s+(\d{1,2})\s*(am|pm)'
+    ]
+    
+    for pattern in time_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            groups = match.groups()
+            hour = int(groups[0])
+            minute = int(groups[1]) if len(groups) > 1 and groups[1] and groups[1].isdigit() else 0
+            
+            # Check for am/pm in any group
+            ampm = None
+            for g in groups:
+                if g in ['am', 'pm']:
+                    ampm = g
+                    break
+            
+            if ampm == 'pm' and hour != 12:
+                hour += 12
+            elif ampm == 'am' and hour == 12:
+                hour = 0
+            
+            target_time = f"{hour:02d}:{minute:02d}"
+            break
     
     return {
-        'datetime': parsed,
-        'date': parsed.strftime('%Y-%m-%d'),
-        'time': parsed.strftime('%H:%M'),
-        'is_recurring': recurring
+        'datetime': target_date,
+        'date': target_date.strftime('%Y-%m-%d'),
+        'time': target_time,
+        'is_recurring': is_recurring
     }
 
 def extract_task_name(text):
-    """Remove date/time parts from text to get task name"""
-    # Common patterns to remove
+    """Remove date/time parts to get clean task name"""
+    # Remove common date/time phrases
     patterns = [
         r'tomorrow',
         r'today',
-        r'next \w+',
-        r'every \w+',
-        r'at \d{1,2}(?::\d{2})?\s*(?:am|pm)?',
-        r'\d{1,2}(?::\d{2})?\s*(?:am|pm)',
-        r'on \w+ \d{1,2}(?:st|nd|rd|th)?',
-        r'\w+ \d{1,2},? \d{4}',
-        r'in \d+ (?:days?|weeks?|months?)',
+        r'next (monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)',
+        r'every (day|week|month|monday|tuesday|wednesday|thursday|friday)',
+        r'in \d+ days?',
+        r'at \d{1,2}:\d{2}\s*(?:am|pm)?',
+        r'at \d{1,2}\s*(?:am|pm)',
+        r'\d{1,2}:\d{2}\s*(?:am|pm)',
+        r'on \w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}',
+        r'(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2}',
         r'(?:daily|weekly|monthly)',
     ]
     
@@ -245,7 +325,6 @@ def delete_task_db(task_id, user_id):
     conn.commit()
     conn.close()
 
-# States
 (NATURAL_INPUT, CONFIRM) = range(2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,11 +336,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
         f"🕐 Your time: {local_time.strftime('%H:%M')} ({friendly})\n\n"
-        f"📝 /add - Add task with natural language\n"
+        f"📝 /add - Add task\n"
         f"   Examples:\n"
-        f"   • 'Submit report tomorrow at 2pm'\n"
-        f"   • 'Team meeting every Friday at 10am'\n"
-        f"   • 'Call mom June 15 at 3pm'\n\n"
+        f"   • 'Call John tomorrow at 3pm'\n"
+        f"   • 'Meeting every Friday at 10am'\n"
+        f"   • 'Pay rent on June 15 at 9am'\n\n"
         f"🌍 /timezone - Change city\n"
         f"📋 /list - View tasks\n"
         f"❌ /delete - Remove task"
@@ -288,10 +367,10 @@ async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📝 What should I remind you about?\n\n"
         "Examples:\n"
-        "• 'Submit report tomorrow at 2pm'\n"
-        "• 'Team meeting every Friday at 10am'\n"
-        "• 'Call mom on June 15, 2026 at 3pm'\n"
-        "• 'Pay rent on the 1st at 9am'"
+        "• Call John tomorrow at 3pm\n"
+        "• Meeting every Friday at 10am\n"
+        "• Pay rent June 15 at 9am\n"
+        "• Doctor appointment in 2 days at 2pm"
     )
     return NATURAL_INPUT
 
@@ -305,33 +384,32 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     
     if not parsed:
         await update.message.reply_text(
-            "❌ Couldn't understand the date/time.\n\n"
-            "Try formats like:\n"
-            "• 'tomorrow at 3pm'\n"
-            "• 'June 15, 2026 at 10am'\n"
-            "• 'next Friday at 9am'"
+            "❌ Couldn't understand. Try:\n"
+            "• tomorrow at 3pm\n"
+            "• next Monday at 10am\n"
+            "• June 15 at 2pm"
         )
         return NATURAL_INPUT
     
-    if parsed['datetime'] < datetime.now(pytz.timezone(timezone_str)):
-        await update.message.reply_text("❌ That time is in the past! Try a future date/time.")
+    # Check if date is in past
+    user_tz = pytz.timezone(timezone_str)
+    now = datetime.now(user_tz)
+    parsed_dt = parsed['datetime']
+    
+    if parsed_dt < now:
+        await update.message.reply_text("❌ That time is in the past! Try a future time.")
         return NATURAL_INPUT
     
     # Extract task name
     task_name = extract_task_name(user_input)
     
     if not task_name or task_name == user_input:
-        await update.message.reply_text("What's the task name? (e.g., 'Submit report')")
+        await update.message.reply_text("What's the task? (e.g., 'Call John')")
         context.user_data['parsed'] = parsed
         context.user_data['awaiting_name'] = True
         return NATURAL_INPUT
     
-    return await confirm_task(update, context, task_name, parsed)
-
-async def confirm_task(update, context, task_name, parsed):
-    user_id = update.effective_user.id
-    timezone_str = get_user_timezone(user_id)
-    
+    # Store and confirm
     context.user_data['task_name'] = task_name
     context.user_data['parsed'] = parsed
     
@@ -377,35 +455,31 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Determine frequency
     frequency = 'once'
-    is_recurring = parsed['is_recurring']
-    
-    if is_recurring:
-        text_lower = query.message.text.lower()
-        if 'day' in text_lower:
-            frequency = 'daily'
-        elif 'week' in text_lower:
+    if parsed['is_recurring']:
+        text_lower = task_name.lower()
+        if 'week' in text_lower:
             frequency = 'weekly'
         elif 'month' in text_lower:
             frequency = 'monthly'
         else:
-            frequency = 'daily'  # default
+            frequency = 'daily'
     
     add_task_db(
         user_id=user_id,
         name=task_name,
         time_str=parsed['time'],
         date_str=parsed['date'],
-        is_recurring=is_recurring,
+        is_recurring=parsed['is_recurring'],
         frequency=frequency
     )
     
-    when_text = "starting " + parsed['date'] if is_recurring else "on " + parsed['date']
+    when = "starting " + parsed['date'] if parsed['is_recurring'] else "on " + parsed['date']
     
     await query.edit_message_text(
         f"✅ Added!\n\n"
         f"📝 {task_name}\n"
-        f"⏰ {parsed['time']} {when_text}\n"
-        f"{'🔁 ' + frequency if is_recurring else '☑️ One-time'}"
+        f"⏰ {parsed['time']} {when}\n"
+        f"{'🔁 ' + frequency if parsed['is_recurring'] else '☑️ One-time'}"
     )
     
     return ConversationHandler.END
@@ -486,11 +560,11 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     for task in tasks:
         try:
             local_time = utc_to_local(current_time, task[3])
-            recurring_note = "🔁 Daily" if task[5] else ""
+            recurring_note = "🔁 " if task[5] else ""
             
             await context.bot.send_message(
                 chat_id=task[1],
-                text=f"🔔 Reminder {recurring_note}\n\n{task[2]}\n(Your time: {local_time})"
+                text=f"🔔 {recurring_note}Reminder\n\n{task[2]}\nYour time: {local_time}"
             )
         except Exception as e:
             logger.error(f"Failed: {e}")
@@ -499,7 +573,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot - Natural Language Dates</h1>"
+    return "<h1>Mula Bot - Natural Language</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
@@ -530,7 +604,7 @@ def main():
     
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
-    logger.info("Bot with natural language started!")
+    logger.info("Bot started!")
     application.run_polling()
 
 if __name__ == '__main__':
