@@ -26,11 +26,29 @@ logger = logging.getLogger(__name__)
 DB_FILE = "reminders.db"
 TOKEN = os.environ.get("TOKEN")
 
-TIMEZONES = [
-    ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'],
-    ['Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow'],
-    ['Asia/Tokyo', 'Asia/Shanghai', 'Asia/Dubai', 'Asia/Singapore'],
-    ['Australia/Sydney', 'Pacific/Auckland', 'UTC']
+TIMEZONE_MAP = {
+    'New York': 'America/New_York',
+    'Chicago': 'America/Chicago',
+    'Denver': 'America/Denver',
+    'Los Angeles': 'America/Los_Angeles',
+    'London': 'Europe/London',
+    'Paris': 'Europe/Paris',
+    'Berlin': 'Europe/Berlin',
+    'Moscow': 'Europe/Moscow',
+    'Tokyo': 'Asia/Tokyo',
+    'Shanghai': 'Asia/Shanghai',
+    'Dubai': 'Asia/Dubai',
+    'Singapore': 'Asia/Singapore',
+    'Sydney': 'Australia/Sydney',
+    'Auckland': 'Pacific/Auckland',
+    'UTC': 'UTC'
+}
+
+TIMEZONE_DISPLAY = [
+    ['New York', 'Chicago', 'Denver', 'Los Angeles'],
+    ['London', 'Paris', 'Berlin', 'Moscow'],
+    ['Tokyo', 'Shanghai', 'Dubai', 'Singapore'],
+    ['Sydney', 'Auckland', 'UTC']
 ]
 
 def init_db():
@@ -80,6 +98,12 @@ def set_user_timezone(user_id, timezone):
     )
     conn.commit()
     conn.close()
+
+def get_friendly_name(actual_tz):
+    for name, actual in TIMEZONE_MAP.items():
+        if actual == actual_tz:
+            return name
+    return actual_tz
 
 def local_to_utc(time_str, timezone_str):
     try:
@@ -155,11 +179,12 @@ def delete_task_db(task_id, user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tz = get_user_timezone(user.id)
+    friendly = get_friendly_name(tz)
     local_time = get_local_time(tz)
     
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
-        f"🕐 Your time: {local_time.strftime('%H:%M')} ({tz})\n\n"
+        f"🕐 Your time: {local_time.strftime('%H:%M')} ({friendly})\n\n"
         f"Commands:\n"
         f"📝 /add - Add task\n"
         f"🌍 /timezone - Change timezone\n"
@@ -168,20 +193,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(tz, callback_data=f"tz_{tz}") for tz in row] for row in TIMEZONES]
-    await update.message.reply_text("🌍 Select your timezone:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [[InlineKeyboardButton(tz, callback_data=f"tz_{tz}") for tz in row] for row in TIMEZONE_DISPLAY]
+    await update.message.reply_text("🌍 Select your city:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    tz = query.data.replace("tz_", "")
+    friendly_name = query.data.replace("tz_", "")
+    actual_tz = TIMEZONE_MAP.get(friendly_name, 'UTC')
     user_id = update.effective_user.id
     
-    set_user_timezone(user_id, tz)
-    local_time = get_local_time(tz)
+    set_user_timezone(user_id, actual_tz)
+    local_time = get_local_time(actual_tz)
     
-    await query.edit_message_text(f"✅ Timezone: {tz}\n🕐 Your time: {local_time.strftime('%H:%M %p')}")
+    await query.edit_message_text(f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%H:%M %p')}")
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("What should I remind you about?")
@@ -206,7 +232,7 @@ async def add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     add_task_db(user_id, name, time_str)
     
-    await update.message.reply_text(f"✅ Added: {name} at {time_str} (your time)")
+    await update.message.reply_text(f"✅ Added: {name} at {time_str}")
     return ConversationHandler.END
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,7 +306,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot - Timezone Enabled</h1>"
+    return "<h1>Mula Bot</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
@@ -311,7 +337,7 @@ def main():
     
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
-    logger.info("Bot with timezones started!")
+    logger.info("Bot started!")
     application.run_polling()
 
 if __name__ == '__main__':
