@@ -2,7 +2,8 @@ import os
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+import pytz
+from datetime import datetime
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,7 +26,13 @@ logger = logging.getLogger(__name__)
 DB_FILE = "reminders.db"
 TOKEN = os.environ.get("TOKEN")
 
-# Database setup
+TIMEZONES = [
+    ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'],
+    ['Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow'],
+    ['Asia/Tokyo', 'Asia/Shanghai', 'Asia/Dubai', 'Asia/Singapore'],
+    ['Australia/Sydney', 'Pacific/Auckland', 'UTC']
+]
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -36,6 +43,7 @@ def init_db():
             user_id INTEGER NOT NULL,
             task_name TEXT NOT NULL,
             reminder_time TEXT NOT NULL,
+            reminder_time_utc TEXT,
             due_date TEXT,
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -55,24 +63,82 @@ def init_db():
 
 init_db()
 
-# Helper functions
-def get_tasks(user_id):
+def get_user_timezone(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else 'UTC'
+
+def set_user_timezone(user_id, timezone):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, task_name, reminder_time, due_date FROM tasks WHERE user_id = ? AND is_active = 1",
+        "INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)",
+        (user_id, timezone)
+    )
+    conn.commit()
+    conn.close()
+
+def local_to_utc(time_str, timezone_str):
+    try:
+        tz = pytz.timezone(timezone_str)
+        today = datetime.now().strftime('%Y-%m-%d')
+        local_dt = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %H:%M")
+        local_dt = tz.localize(local_dt)
+        utc_dt = local_dt.astimezone(pytz.UTC)
+        return utc_dt.strftime("%H:%M")
+    except:
+        return time_str
+
+def utc_to_local(utc_time_str, timezone_str):
+    try:
+        utc = pytz.UTC
+        tz = pytz.timezone(timezone_str)
+        today = datetime.now(utc).strftime('%Y-%m-%d')
+        utc_dt = datetime.strptime(f"{today} {utc_time_str}", "%Y-%m-%d %H:%M")
+        utc_dt = utc.localize(utc_dt)
+        local_dt = utc_dt.astimezone(tz)
+        return local_dt.strftime("%H:%M")
+    except:
+        return utc_time_str
+
+def get_local_time(timezone_str):
+    tz = pytz.timezone(timezone_str)
+    return datetime.now(tz)
+
+def get_tasks(user_id):
+    timezone_str = get_user_timezone(user_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, task_name, reminder_time, reminder_time_utc, due_date FROM tasks WHERE user_id = ? AND is_active = 1",
         (user_id,)
     )
-    tasks = cursor.fetchall()
+    rows = cursor.fetchall()
     conn.close()
+    
+    tasks = []
+    for row in rows:
+        local_time = utc_to_local(row[3] or row[2], timezone_str)
+        tasks.append({
+            'id': row[0],
+            'name': row[1],
+            'time': local_time,
+            'due_date': row[4]
+        })
     return tasks
 
-def add_task_db(user_id, name, time, due_date=None):
+def add_task_db(user_id, name, time_str):
+    timezone_str = get_user_timezone(user_id)
+    utc_time = local_to_utc(time_str, timezone_str)
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO tasks (user_id, task_name, reminder_time, due_date) VALUES (?, ?, ?, ?)",
-        (user_id, name, time, due_date)
+        "INSERT INTO tasks (user_id, task_name, reminder_time, reminder_time_utc) VALUES (?, ?, ?, ?)",
+        (user_id, name, time_str, utc_time)
     )
     conn.commit()
     conn.close()
@@ -84,27 +150,38 @@ def delete_task_db(task_id, user_id):
     conn.commit()
     conn.close()
 
-# States
 (NAME, TIME) = range(2)
 
-# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    tz = get_user_timezone(user.id)
+    local_time = get_local_time(tz)
+    
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
-        "📝 /add - Add new task\n"
-        "📋 /list - View tasks\n"
-        "❌ /delete - Remove task\n"
-        "❓ /help - Show commands"
+        f"🕐 Your time: {local_time.strftime('%H:%M')} ({tz})\n\n"
+        f"Commands:\n"
+        f"📝 /add - Add task\n"
+        f"🌍 /timezone - Change timezone\n"
+        f"📋 /list - View tasks\n"
+        f"❌ /delete - Remove task"
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands:\n"
-        "/add - Create reminder\n"
-        "/list - See all tasks\n"
-        "/delete - Delete task"
-    )
+async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(tz, callback_data=f"tz_{tz}") for tz in row] for row in TIMEZONES]
+    await update.message.reply_text("🌍 Select your timezone:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    tz = query.data.replace("tz_", "")
+    user_id = update.effective_user.id
+    
+    set_user_timezone(user_id, tz)
+    local_time = get_local_time(tz)
+    
+    await query.edit_message_text(f"✅ Timezone: {tz}\n🕐 Your time: {local_time.strftime('%H:%M %p')}")
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("What should I remind you about?")
@@ -112,17 +189,16 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['name'] = update.message.text
-    await update.message.reply_text("What time? (HH:MM, 24-hour format)")
+    await update.message.reply_text("What time? (HH:MM, your local time)")
     return TIME
 
 async def add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = update.message.text
     
-    # Simple validation
     try:
         datetime.strptime(time_str, "%H:%M")
     except:
-        await update.message.reply_text("❌ Use format HH:MM (like 09:00 or 14:30)")
+        await update.message.reply_text("❌ Use format HH:MM")
         return TIME
     
     user_id = update.effective_user.id
@@ -130,7 +206,7 @@ async def add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     add_task_db(user_id, name, time_str)
     
-    await update.message.reply_text(f"✅ Added: {name} at {time_str}")
+    await update.message.reply_text(f"✅ Added: {name} at {time_str} (your time)")
     return ConversationHandler.END
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -143,7 +219,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = "📋 Your Tasks:\n\n"
     for task in tasks:
-        msg += f"• {task[1]} at {task[2]}\n"
+        msg += f"• {task['name']} at {task['time']}\n"
     
     await update.message.reply_text(msg)
 
@@ -157,15 +233,9 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = []
     for task in tasks:
-        keyboard.append([InlineKeyboardButton(
-            f"🗑️ {task[1]}", 
-            callback_data=f"del_{task[0]}"
-        )])
+        keyboard.append([InlineKeyboardButton(f"🗑️ {task['name']}", callback_data=f"del_{task['id']}")])
     
-    await update.message.reply_text(
-        "Delete which task?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("Delete which?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -181,16 +251,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled")
     return ConversationHandler.END
 
-# Reminder job
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
+    now = datetime.utcnow()
     current_time = now.strftime("%H:%M")
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT t.id, t.user_id, t.task_name FROM tasks t "
-        "WHERE t.reminder_time = ? AND t.is_active = 1",
+        "SELECT t.id, t.user_id, t.task_name, u.timezone FROM tasks t "
+        "JOIN users u ON t.user_id = u.user_id "
+        "WHERE t.reminder_time_utc = ? AND t.is_active = 1",
         (current_time,)
     )
     tasks = cursor.fetchall()
@@ -198,32 +268,30 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     
     for task in tasks:
         try:
+            local_time = utc_to_local(current_time, task[3])
             await context.bot.send_message(
                 chat_id=task[1],
-                text=f"🔔 Reminder: {task[2]}"
+                text=f"🔔 Reminder: {task[2]}\n(Your time: {local_time})"
             )
         except Exception as e:
-            logger.error(f"Failed to send: {e}")
+            logger.error(f"Failed: {e}")
 
-# Flask app
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot is running!</h1>"
+    return "<h1>Mula Bot - Timezone Enabled</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
 
-# Main
 def main():
     if not TOKEN:
-        logger.error("No TOKEN found!")
+        logger.error("No TOKEN!")
         return
     
     application = Application.builder().token(TOKEN).build()
     
-    # Add conversation handler
     add_conv = ConversationHandler(
         entry_points=[CommandHandler('add', add_start)],
         states={
@@ -233,18 +301,17 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     
-    # Add handlers
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_cmd))
+    application.add_handler(CommandHandler('timezone', timezone_cmd))
+    application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
     application.add_handler(CommandHandler('list', list_tasks))
     application.add_handler(CommandHandler('delete', delete_start))
     application.add_handler(add_conv)
     application.add_handler(CallbackQueryHandler(delete_callback, pattern='^del_'))
     
-    # Schedule reminders
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
-    logger.info("Bot started!")
+    logger.info("Bot with timezones started!")
     application.run_polling()
 
 if __name__ == '__main__':
