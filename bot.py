@@ -109,20 +109,51 @@ def get_friendly_name(actual_tz):
             return name
     return actual_tz
 
+def normalize_time(time_str):
+    """Fix common time format issues like 245pm -> 2:45pm"""
+    # Fix 245pm -> 2:45pm
+    time_str = re.sub(r'(\d{1,2})(\d{2})(am|pm)', r'\1:\2\3', time_str, flags=re.IGNORECASE)
+    return time_str
+
 def parse_natural_date(text, timezone_str):
-    """Simplified reliable parser"""
+    """Improved parser with better date/time extraction"""
     text_lower = text.lower()
     now = datetime.now(pytz.timezone(timezone_str))
     
-    target_date = now
+    target_date = None
     target_time = "09:00"
     is_recurring = False
+    
+    # Normalize time format first
+    text_normalized = normalize_time(text)
     
     # Check for recurring
     if any(word in text_lower for word in ['every', 'daily', 'each', 'weekly', 'monthly']):
         is_recurring = True
     
-    # Parse date keywords
+    # Try dateparser first on full normalized text
+    settings = {
+        'TIMEZONE': timezone_str,
+        'RETURN_AS_TIMEZONE_AWARE': True,
+        'PREFER_DATES_FROM': 'future',
+        'RELATIVE_BASE': now
+    }
+    
+    parsed = dateparser.parse(text_normalized, settings=settings)
+    
+    if parsed:
+        # Check if it's actually in the future
+        if parsed > now:
+            return {
+                'datetime': parsed,
+                'date': parsed.strftime('%Y-%m-%d'),
+                'time': parsed.strftime('%H:%M'),
+                'is_recurring': is_recurring
+            }
+        # If parsed date is in past but has year specified, it might be next year
+        # Let it through and we'll check later
+    
+    # Manual parsing for common patterns
     if 'tomorrow' in text_lower:
         target_date = now + timedelta(days=1)
     elif 'today' in text_lower:
@@ -158,60 +189,69 @@ def parse_natural_date(text, timezone_str):
         if days_ahead <= 0:
             days_ahead += 7
         target_date = now + timedelta(days=days_ahead)
-    else:
-        # Try dateparser for specific dates like "June 15, 2026"
-        settings = {
-            'TIMEZONE': timezone_str,
-            'RETURN_AS_TIMEZONE_AWARE': True,
-            'PREFER_DATES_FROM': 'future',
+    
+    # If we have a target date from manual parsing, extract time
+    if target_date:
+        # Extract time with improved regex
+        time_patterns = [
+            r'(\d{1,2}):(\d{2})\s*(am|pm)',
+            r'(\d{1,2})\s*(am|pm)',
+            r'at\s+(\d{1,2}):(\d{2})',
+            r'at\s+(\d{1,2})\s*(am|pm)'
+        ]
+        
+        for pattern in time_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                groups = match.groups()
+                hour = int(groups[0])
+                minute = int(groups[1]) if len(groups) > 1 and groups[1] and groups[1].isdigit() else 0
+                
+                ampm = None
+                for g in groups:
+                    if g in ['am', 'pm']:
+                        ampm = g
+                        break
+                
+                if ampm == 'pm' and hour != 12:
+                    hour += 12
+                elif ampm == 'am' and hour == 12:
+                    hour = 0
+                
+                target_time = f"{hour:02d}:{minute:02d}"
+                break
+        
+        return {
+            'datetime': target_date,
+            'date': target_date.strftime('%Y-%m-%d'),
+            'time': target_time,
+            'is_recurring': is_recurring
         }
-        parsed = dateparser.parse(text, settings=settings)
-        if parsed:
-            target_date = parsed
-            target_time = parsed.strftime('%H:%M')
+    
+    # If dateparser worked but date is in past, try adding a year
+    if parsed:
+        # If the parsed date is in the past, assume next year
+        if parsed <= now:
+            try:
+                # Try to parse with explicit year handling
+                settings['PREFER_DATES_FROM'] = 'future'
+                settings['STRICT_PARSING'] = False
+                parsed = dateparser.parse(text_normalized + " next year", settings=settings)
+                if not parsed or parsed <= now:
+                    # Just add one year manually
+                    parsed = parsed.replace(year=parsed.year + 1) if parsed else None
+            except:
+                pass
+        
+        if parsed and parsed > now:
             return {
                 'datetime': parsed,
                 'date': parsed.strftime('%Y-%m-%d'),
-                'time': target_time,
+                'time': parsed.strftime('%H:%M'),
                 'is_recurring': is_recurring
             }
     
-    # Extract time with regex
-    time_patterns = [
-        r'(\d{1,2}):(\d{2})\s*(am|pm)',
-        r'(\d{1,2})\s*(am|pm)',
-        r'at\s+(\d{1,2}):(\d{2})',
-        r'at\s+(\d{1,2})\s*(am|pm)'
-    ]
-    
-    for pattern in time_patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            groups = match.groups()
-            hour = int(groups[0])
-            minute = int(groups[1]) if len(groups) > 1 and groups[1] and groups[1].isdigit() else 0
-            
-            # Check for am/pm in any group
-            ampm = None
-            for g in groups:
-                if g in ['am', 'pm']:
-                    ampm = g
-                    break
-            
-            if ampm == 'pm' and hour != 12:
-                hour += 12
-            elif ampm == 'am' and hour == 12:
-                hour = 0
-            
-            target_time = f"{hour:02d}:{minute:02d}"
-            break
-    
-    return {
-        'datetime': target_date,
-        'date': target_date.strftime('%Y-%m-%d'),
-        'time': target_time,
-        'is_recurring': is_recurring
-    }
+    return None
 
 def extract_task_name(text):
     """Remove date/time parts to get clean task name"""
@@ -224,8 +264,9 @@ def extract_task_name(text):
         r'at \d{1,2}:\d{2}\s*(?:am|pm)?',
         r'at \d{1,2}\s*(?:am|pm)',
         r'\d{1,2}:\d{2}\s*(?:am|pm)',
+        r'\d{1,2}\d{2}\s*(?:am|pm)',  # 245pm
         r'on \w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}',
-        r'(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2}',
+        r'(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2}(?:,?\s*\d{4})?',
         r'(?:daily|weekly|monthly)',
     ]
     
@@ -338,7 +379,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   Examples:\n"
         f"   • 'Call John tomorrow at 3pm'\n"
         f"   • 'Meeting every Friday at 10am'\n"
-        f"   • 'Pay rent June 15 at 9am'\n\n"
+        f"   • 'Pay rent March 31 at 2:45pm'\n\n"
         f"🌍 /timezone - Change city\n"
         f"📋 /list - View tasks\n"
         f"❌ /delete - Remove task"
@@ -367,7 +408,7 @@ async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Examples:\n"
         "• Call John tomorrow at 3pm\n"
         "• Meeting every Friday at 10am\n"
-        "• Pay rent June 15 at 9am\n"
+        "• Pay rent March 31 at 2:45pm\n"
         "• Doctor appointment in 2 days at 2pm"
     )
     return NATURAL_INPUT
@@ -377,14 +418,17 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     timezone_str = get_user_timezone(user_id)
     
-    parsed = parse_natural_date(user_input, timezone_str)
+    # Normalize input
+    user_input_normalized = normalize_time(user_input)
+    
+    parsed = parse_natural_date(user_input_normalized, timezone_str)
     
     if not parsed:
         await update.message.reply_text(
             "❌ Couldn't understand. Try:\n"
             "• tomorrow at 3pm\n"
-            "• next Monday at 10am\n"
-            "• June 15 at 2pm"
+            "• March 31 at 2:45pm\n"
+            "• next Monday at 10am"
         )
         return NATURAL_INPUT
     
@@ -392,14 +436,26 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     now = datetime.now(user_tz)
     parsed_dt = parsed['datetime']
     
-    if parsed_dt < now:
-        await update.message.reply_text("❌ That time is in the past! Try a future time.")
+    # Check if date is in past (with 1 minute buffer)
+    if parsed_dt < now - timedelta(minutes=1):
+        # If it's a specific date without year, maybe they meant next year
+        days_diff = (now - parsed_dt).days
+        if days_diff > 365:
+            await update.message.reply_text(
+                f"❌ That date ({parsed['date']}) is in the past!\n"
+                f"Did you mean March 31, {now.year + 1}?"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ That time ({parsed['date']} {parsed['time']}) is in the past!\n"
+                f"Try a future date/time."
+            )
         return NATURAL_INPUT
     
     task_name = extract_task_name(user_input)
     
     if not task_name or task_name == user_input:
-        await update.message.reply_text("What's the task? (e.g., 'Call John')")
+        await update.message.reply_text("What's the task? (e.g., 'Pay rent')")
         context.user_data['parsed'] = parsed
         context.user_data['awaiting_name'] = True
         return NATURAL_INPUT
@@ -575,7 +631,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot - Natural Language</h1>"
+    return "<h1>Mula Bot - Fixed Parser</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
