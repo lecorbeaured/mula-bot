@@ -215,7 +215,6 @@ def parse_natural_date(text, timezone_str):
 
 def extract_task_name(text):
     """Remove date/time parts to get clean task name"""
-    # Remove common date/time phrases
     patterns = [
         r'tomorrow',
         r'today',
@@ -234,7 +233,6 @@ def extract_task_name(text):
     for pattern in patterns:
         name = re.sub(pattern, '', name, flags=re.IGNORECASE)
     
-    # Clean up
     name = re.sub(r'\s+', ' ', name).strip()
     name = re.sub(r'^(?:remind me to|remind me|to)\s*', '', name, flags=re.IGNORECASE)
     
@@ -340,7 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   Examples:\n"
         f"   • 'Call John tomorrow at 3pm'\n"
         f"   • 'Meeting every Friday at 10am'\n"
-        f"   • 'Pay rent on June 15 at 9am'\n\n"
+        f"   • 'Pay rent June 15 at 9am'\n\n"
         f"🌍 /timezone - Change city\n"
         f"📋 /list - View tasks\n"
         f"❌ /delete - Remove task"
@@ -379,7 +377,6 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     timezone_str = get_user_timezone(user_id)
     
-    # Parse the date
     parsed = parse_natural_date(user_input, timezone_str)
     
     if not parsed:
@@ -391,7 +388,6 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return NATURAL_INPUT
     
-    # Check if date is in past
     user_tz = pytz.timezone(timezone_str)
     now = datetime.now(user_tz)
     parsed_dt = parsed['datetime']
@@ -400,7 +396,6 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ That time is in the past! Try a future time.")
         return NATURAL_INPUT
     
-    # Extract task name
     task_name = extract_task_name(user_input)
     
     if not task_name or task_name == user_input:
@@ -409,7 +404,6 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['awaiting_name'] = True
         return NATURAL_INPUT
     
-    # Store and confirm
     context.user_data['task_name'] = task_name
     context.user_data['parsed'] = parsed
     
@@ -440,20 +434,27 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     return CONFIRM
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle both Yes and Cancel buttons"""
     query = update.callback_query
     await query.answer()
     
+    user_id = update.effective_user.id
+    
     if query.data == 'cancel':
         await query.edit_message_text("❌ Cancelled")
+        context.user_data.clear()
         return ConversationHandler.END
     
-    user_id = update.effective_user.id
+    # Handle confirm_add
     data = context.user_data
+    
+    if not data.get('parsed'):
+        await query.edit_message_text("❌ Error: No task data found")
+        return ConversationHandler.END
     
     task_name = data.get('task_name', 'Task')
     parsed = data['parsed']
     
-    # Determine frequency
     frequency = 'once'
     if parsed['is_recurring']:
         text_lower = task_name.lower()
@@ -482,6 +483,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{'🔁 ' + frequency if parsed['is_recurring'] else '☑️ One-time'}"
     )
     
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,9 +591,9 @@ def main():
         entry_points=[CommandHandler('add', add_smart)],
         states={
             NATURAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_natural_input)],
-            CONFIRM: [CallbackQueryHandler(confirm_callback, pattern='^confirm_')],
+            CONFIRM: [CallbackQueryHandler(confirm_callback)],
         },
-        fallbacks=[CommandHandler('cancel', cancel), CallbackQueryHandler(cancel, pattern='^cancel')],
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
     
     application.add_handler(CommandHandler('start', start))
