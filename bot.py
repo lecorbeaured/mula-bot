@@ -3,8 +3,10 @@ import logging
 import sqlite3
 import threading
 import pytz
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
+import dateparser
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -63,6 +65,8 @@ def init_db():
             reminder_time TEXT NOT NULL,
             reminder_time_utc TEXT,
             due_date TEXT,
+            is_recurring INTEGER DEFAULT 0,
+            frequency TEXT DEFAULT 'once',
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -105,11 +109,61 @@ def get_friendly_name(actual_tz):
             return name
     return actual_tz
 
-def local_to_utc(time_str, timezone_str):
+def parse_natural_date(text, timezone_str):
+    """Parse natural language dates"""
+    settings = {
+        'TIMEZONE': timezone_str,
+        'RETURN_AS_TIMEZONE_AWARE': True,
+        'PREFER_DATES_FROM': 'future',
+        'RELATIVE_BASE': datetime.now()
+    }
+    
+    # Check for recurring keywords
+    recurring = any(word in text.lower() for word in ['every', 'daily', 'weekly', 'monthly', 'each'])
+    
+    # Try to parse
+    parsed = dateparser.parse(text, settings=settings)
+    
+    if not parsed:
+        return None
+    
+    return {
+        'datetime': parsed,
+        'date': parsed.strftime('%Y-%m-%d'),
+        'time': parsed.strftime('%H:%M'),
+        'is_recurring': recurring
+    }
+
+def extract_task_name(text):
+    """Remove date/time parts from text to get task name"""
+    # Common patterns to remove
+    patterns = [
+        r'tomorrow',
+        r'today',
+        r'next \w+',
+        r'every \w+',
+        r'at \d{1,2}(?::\d{2})?\s*(?:am|pm)?',
+        r'\d{1,2}(?::\d{2})?\s*(?:am|pm)',
+        r'on \w+ \d{1,2}(?:st|nd|rd|th)?',
+        r'\w+ \d{1,2},? \d{4}',
+        r'in \d+ (?:days?|weeks?|months?)',
+        r'(?:daily|weekly|monthly)',
+    ]
+    
+    name = text
+    for pattern in patterns:
+        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+    
+    # Clean up
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = re.sub(r'^(?:remind me to|remind me|to)\s*', '', name, flags=re.IGNORECASE)
+    
+    return name if name else "Task"
+
+def local_to_utc(time_str, date_str, timezone_str):
     try:
         tz = pytz.timezone(timezone_str)
-        today = datetime.now().strftime('%Y-%m-%d')
-        local_dt = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %H:%M")
+        local_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         local_dt = tz.localize(local_dt)
         utc_dt = local_dt.astimezone(pytz.UTC)
         return utc_dt.strftime("%H:%M")
@@ -134,11 +188,16 @@ def get_local_time(timezone_str):
 
 def get_tasks(user_id):
     timezone_str = get_user_timezone(user_id)
+    today = datetime.now().strftime('%Y-%m-%d')
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, task_name, reminder_time, reminder_time_utc, due_date FROM tasks WHERE user_id = ? AND is_active = 1",
-        (user_id,)
+        """SELECT id, task_name, reminder_time, reminder_time_utc, due_date, 
+           is_recurring, frequency FROM tasks 
+           WHERE user_id = ? AND is_active = 1
+           AND (due_date IS NULL OR due_date >= ? OR is_recurring = 1)""",
+        (user_id, today)
     )
     rows = cursor.fetchall()
     conn.close()
@@ -146,23 +205,35 @@ def get_tasks(user_id):
     tasks = []
     for row in rows:
         local_time = utc_to_local(row[3] or row[2], timezone_str)
+        due = row[4]
+        days_until = None
+        
+        if due:
+            date_obj = datetime.strptime(due, '%Y-%m-%d')
+            days_until = (date_obj - datetime.now()).days
+        
         tasks.append({
             'id': row[0],
             'name': row[1],
             'time': local_time,
-            'due_date': row[4]
+            'due_date': due,
+            'is_recurring': row[5],
+            'frequency': row[6],
+            'days_until': days_until
         })
     return tasks
 
-def add_task_db(user_id, name, time_str):
+def add_task_db(user_id, name, time_str, date_str=None, is_recurring=False, frequency='once'):
     timezone_str = get_user_timezone(user_id)
-    utc_time = local_to_utc(time_str, timezone_str)
+    utc_time = local_to_utc(time_str, date_str or datetime.now().strftime('%Y-%m-%d'), timezone_str)
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO tasks (user_id, task_name, reminder_time, reminder_time_utc) VALUES (?, ?, ?, ?)",
-        (user_id, name, time_str, utc_time)
+        """INSERT INTO tasks 
+           (user_id, task_name, reminder_time, reminder_time_utc, due_date, is_recurring, frequency) 
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, name, time_str, utc_time, date_str, 1 if is_recurring else 0, frequency)
     )
     conn.commit()
     conn.close()
@@ -174,7 +245,8 @@ def delete_task_db(task_id, user_id):
     conn.commit()
     conn.close()
 
-(NAME, TIME) = range(2)
+# States
+(NATURAL_INPUT, CONFIRM) = range(2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -185,9 +257,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
         f"🕐 Your time: {local_time.strftime('%H:%M')} ({friendly})\n\n"
-        f"Commands:\n"
-        f"📝 /add - Add task\n"
-        f"🌍 /timezone - Change timezone\n"
+        f"📝 /add - Add task with natural language\n"
+        f"   Examples:\n"
+        f"   • 'Submit report tomorrow at 2pm'\n"
+        f"   • 'Team meeting every Friday at 10am'\n"
+        f"   • 'Call mom June 15 at 3pm'\n\n"
+        f"🌍 /timezone - Change city\n"
         f"📋 /list - View tasks\n"
         f"❌ /delete - Remove task"
     )
@@ -209,30 +284,130 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%H:%M %p')}")
 
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("What should I remind you about?")
-    return NAME
+async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📝 What should I remind you about?\n\n"
+        "Examples:\n"
+        "• 'Submit report tomorrow at 2pm'\n"
+        "• 'Team meeting every Friday at 10am'\n"
+        "• 'Call mom on June 15, 2026 at 3pm'\n"
+        "• 'Pay rent on the 1st at 9am'"
+    )
+    return NATURAL_INPUT
 
-async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['name'] = update.message.text
-    await update.message.reply_text("What time? (HH:MM, your local time)")
-    return TIME
-
-async def add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    time_str = update.message.text
+async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text
+    user_id = update.effective_user.id
+    timezone_str = get_user_timezone(user_id)
     
-    try:
-        datetime.strptime(time_str, "%H:%M")
-    except:
-        await update.message.reply_text("❌ Use format HH:MM")
-        return TIME
+    # Parse the date
+    parsed = parse_natural_date(user_input, timezone_str)
+    
+    if not parsed:
+        await update.message.reply_text(
+            "❌ Couldn't understand the date/time.\n\n"
+            "Try formats like:\n"
+            "• 'tomorrow at 3pm'\n"
+            "• 'June 15, 2026 at 10am'\n"
+            "• 'next Friday at 9am'"
+        )
+        return NATURAL_INPUT
+    
+    if parsed['datetime'] < datetime.now(pytz.timezone(timezone_str)):
+        await update.message.reply_text("❌ That time is in the past! Try a future date/time.")
+        return NATURAL_INPUT
+    
+    # Extract task name
+    task_name = extract_task_name(user_input)
+    
+    if not task_name or task_name == user_input:
+        await update.message.reply_text("What's the task name? (e.g., 'Submit report')")
+        context.user_data['parsed'] = parsed
+        context.user_data['awaiting_name'] = True
+        return NATURAL_INPUT
+    
+    return await confirm_task(update, context, task_name, parsed)
+
+async def confirm_task(update, context, task_name, parsed):
+    user_id = update.effective_user.id
+    timezone_str = get_user_timezone(user_id)
+    
+    context.user_data['task_name'] = task_name
+    context.user_data['parsed'] = parsed
+    
+    date_obj = datetime.strptime(parsed['date'], '%Y-%m-%d')
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    if parsed['date'] == today:
+        date_display = "Today"
+    elif parsed['date'] == (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'):
+        date_display = "Tomorrow"
+    else:
+        days_until = (date_obj - datetime.now()).days
+        date_display = f"{parsed['date']} (in {days_until} days)"
+    
+    recurring_text = "🔁 Recurring" if parsed['is_recurring'] else "☑️ One-time"
+    
+    await update.message.reply_text(
+        f"📝 Task: {task_name}\n"
+        f"📅 Date: {date_display}\n"
+        f"⏰ Time: {parsed['time']}\n"
+        f"🔄 Type: {recurring_text}\n\n"
+        f"Correct?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, add it", callback_data='confirm_add')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel')]
+        ])
+    )
+    return CONFIRM
+
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'cancel':
+        await query.edit_message_text("❌ Cancelled")
+        return ConversationHandler.END
     
     user_id = update.effective_user.id
-    name = context.user_data['name']
+    data = context.user_data
     
-    add_task_db(user_id, name, time_str)
+    task_name = data.get('task_name', 'Task')
+    parsed = data['parsed']
     
-    await update.message.reply_text(f"✅ Added: {name} at {time_str}")
+    # Determine frequency
+    frequency = 'once'
+    is_recurring = parsed['is_recurring']
+    
+    if is_recurring:
+        text_lower = query.message.text.lower()
+        if 'day' in text_lower:
+            frequency = 'daily'
+        elif 'week' in text_lower:
+            frequency = 'weekly'
+        elif 'month' in text_lower:
+            frequency = 'monthly'
+        else:
+            frequency = 'daily'  # default
+    
+    add_task_db(
+        user_id=user_id,
+        name=task_name,
+        time_str=parsed['time'],
+        date_str=parsed['date'],
+        is_recurring=is_recurring,
+        frequency=frequency
+    )
+    
+    when_text = "starting " + parsed['date'] if is_recurring else "on " + parsed['date']
+    
+    await query.edit_message_text(
+        f"✅ Added!\n\n"
+        f"📝 {task_name}\n"
+        f"⏰ {parsed['time']} {when_text}\n"
+        f"{'🔁 ' + frequency if is_recurring else '☑️ One-time'}"
+    )
+    
     return ConversationHandler.END
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,7 +420,18 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = "📋 Your Tasks:\n\n"
     for task in tasks:
-        msg += f"• {task['name']} at {task['time']}\n"
+        emoji = "🔁" if task['is_recurring'] else "☑️"
+        
+        date_info = ""
+        if task['due_date'] and not task['is_recurring']:
+            if task.get('days_until') == 0:
+                date_info = " TODAY"
+            elif task.get('days_until') == 1:
+                date_info = " tomorrow"
+            elif task.get('days_until') and task['days_until'] > 1:
+                date_info = f" ({task['days_until']} days)"
+        
+        msg += f"{emoji}{date_info} {task['name']} at {task['time']}\n"
     
     await update.message.reply_text(msg)
 
@@ -259,7 +445,8 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = []
     for task in tasks:
-        keyboard.append([InlineKeyboardButton(f"🗑️ {task['name']}", callback_data=f"del_{task['id']}")])
+        emoji = "🔁" if task['is_recurring'] else "☑️"
+        keyboard.append([InlineKeyboardButton(f"{emoji} {task['name']}", callback_data=f"del_{task['id']}")])
     
     await update.message.reply_text("Delete which?", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -280,14 +467,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
     current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT t.id, t.user_id, t.task_name, u.timezone FROM tasks t "
-        "JOIN users u ON t.user_id = u.user_id "
-        "WHERE t.reminder_time_utc = ? AND t.is_active = 1",
-        (current_time,)
+        """SELECT t.id, t.user_id, t.task_name, u.timezone, t.due_date, t.is_recurring 
+           FROM tasks t 
+           JOIN users u ON t.user_id = u.user_id 
+           WHERE t.reminder_time_utc = ? 
+           AND t.is_active = 1
+           AND (t.is_recurring = 1 OR t.due_date = ?)""",
+        (current_time, today)
     )
     tasks = cursor.fetchall()
     conn.close()
@@ -295,9 +486,11 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     for task in tasks:
         try:
             local_time = utc_to_local(current_time, task[3])
+            recurring_note = "🔁 Daily" if task[5] else ""
+            
             await context.bot.send_message(
                 chat_id=task[1],
-                text=f"🔔 Reminder: {task[2]}\n(Your time: {local_time})"
+                text=f"🔔 Reminder {recurring_note}\n\n{task[2]}\n(Your time: {local_time})"
             )
         except Exception as e:
             logger.error(f"Failed: {e}")
@@ -306,7 +499,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot</h1>"
+    return "<h1>Mula Bot - Natural Language Dates</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
@@ -319,12 +512,12 @@ def main():
     application = Application.builder().token(TOKEN).build()
     
     add_conv = ConversationHandler(
-        entry_points=[CommandHandler('add', add_start)],
+        entry_points=[CommandHandler('add', add_smart)],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
-            TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_time)],
+            NATURAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_natural_input)],
+            CONFIRM: [CallbackQueryHandler(confirm_callback, pattern='^confirm_')],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler('cancel', cancel), CallbackQueryHandler(cancel, pattern='^cancel')],
     )
     
     application.add_handler(CommandHandler('start', start))
@@ -337,7 +530,7 @@ def main():
     
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
-    logger.info("Bot started!")
+    logger.info("Bot with natural language started!")
     application.run_polling()
 
 if __name__ == '__main__':
