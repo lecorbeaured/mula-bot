@@ -515,7 +515,13 @@ def parse_natural_date(text, timezone_str):
     date_keywords = ['tomorrow', 'today', 'next week', 'monday', 'tuesday', 'wednesday',
                      'thursday', 'friday', 'saturday', 'sunday', 'january', 'february',
                      'march', 'april', 'may', 'june', 'july', 'august', 'september',
-                     'october', 'november', 'december', 'in 2 days', 'in 3 days']
+                     'october', 'november', 'december', 'in 2 days', 'in 3 days',
+                     'in 1 day', 'in 4 days', 'in 5 days', 'in 6 days', 'in 7 days',
+                     'in 1 hour', 'in 2 hours', 'in 3 hours', 'in 4 hours',
+                     'in 5 hours', 'in 6 hours', 'in 12 hours', 'in 24 hours',
+                     'in 30 minutes', 'in 15 minutes', 'in 45 minutes', 'in 10 minutes',
+                     'in 20 minutes', 'in 5 minutes', 'in 1 minute',
+                     'minute', 'minutes', 'mins', 'hour', 'hours']
     has_date_keyword = any(kw in text_lower for kw in date_keywords)
     has_year = bool(re.search(r'\b20\d{2}\b', text_normalized))
 
@@ -666,6 +672,9 @@ def extract_task_name(text):
         r'next (monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)',
         r'every (day|week|month|monday|tuesday|wednesday|thursday|friday)',
         r'in \d+ days?',
+        r'in \d+ hours?',
+        r'in \d+ mins?(?:utes?)?',
+        r'in \d+ seconds?',
         r'at \d{1,2}:\d{2}\s*(?:am|pm)?',
         r'at \d{1,2}\s*(?:am|pm)',
         r'\d{1,2}:\d{2}\s*(?:am|pm)',
@@ -834,31 +843,94 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg_edit(query, f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%I:%M %p')}")
 
+# Common city aliases not found directly in pytz
+CITY_ALIASES = {
+    'las vegas': 'America/Los_Angeles',
+    'phoenix': 'America/Phoenix',
+    'honolulu': 'Pacific/Honolulu',
+    'anchorage': 'America/Anchorage',
+    'toronto': 'America/Toronto',
+    'montreal': 'America/Montreal',
+    'vancouver': 'America/Vancouver',
+    'mexico city': 'America/Mexico_City',
+    'bogota': 'America/Bogota',
+    'lima': 'America/Lima',
+    'buenos aires': 'America/Argentina/Buenos_Aires',
+    'sao paulo': 'America/Sao_Paulo',
+    'santiago': 'America/Santiago',
+    'cairo': 'Africa/Cairo',
+    'lagos': 'Africa/Lagos',
+    'nairobi': 'Africa/Nairobi',
+    'johannesburg': 'Africa/Johannesburg',
+    'lome': 'Africa/Abidjan',
+    'accra': 'Africa/Accra',
+    'dakar': 'Africa/Dakar',
+    'casablanca': 'Africa/Casablanca',
+    'istanbul': 'Europe/Istanbul',
+    'amsterdam': 'Europe/Amsterdam',
+    'stockholm': 'Europe/Stockholm',
+    'oslo': 'Europe/Oslo',
+    'brussels': 'Europe/Brussels',
+    'vienna': 'Europe/Vienna',
+    'zurich': 'Europe/Zurich',
+    'rome': 'Europe/Rome',
+    'madrid': 'Europe/Madrid',
+    'lisbon': 'Europe/Lisbon',
+    'athens': 'Europe/Athens',
+    'warsaw': 'Europe/Warsaw',
+    'prague': 'Europe/Prague',
+    'budapest': 'Europe/Budapest',
+    'bucharest': 'Europe/Bucharest',
+    'helsinki': 'Europe/Helsinki',
+    'riyadh': 'Asia/Riyadh',
+    'tehran': 'Asia/Tehran',
+    'karachi': 'Asia/Karachi',
+    'mumbai': 'Asia/Kolkata',
+    'delhi': 'Asia/Kolkata',
+    'new delhi': 'Asia/Kolkata',
+    'kolkata': 'Asia/Kolkata',
+    'dhaka': 'Asia/Dhaka',
+    'bangkok': 'Asia/Bangkok',
+    'jakarta': 'Asia/Jakarta',
+    'manila': 'Asia/Manila',
+    'hong kong': 'Asia/Hong_Kong',
+    'taipei': 'Asia/Taipei',
+    'seoul': 'Asia/Seoul',
+    'osaka': 'Asia/Tokyo',
+    'beijing': 'Asia/Shanghai',
+    'melbourne': 'Australia/Melbourne',
+    'brisbane': 'Australia/Brisbane',
+    'perth': 'Australia/Perth',
+}
+
 async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle free-text timezone input after user taps Other..."""
     if not context.user_data.get('awaiting_custom_tz'):
         return
-    
+
     user_input = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # Try to match input as a city name using pytz
-    import pytz as _pytz
-
-    # First try direct pytz lookup (e.g. "America/Chicago")
     matched_tz = None
-    try:
-        _pytz.timezone(user_input)
-        matched_tz = user_input
-    except _pytz.exceptions.UnknownTimeZoneError:
-        pass
 
-    # Try fuzzy city match against all pytz timezones
+    # 1. Check city aliases first
+    alias_key = user_input.lower().strip()
+    if alias_key in CITY_ALIASES:
+        matched_tz = CITY_ALIASES[alias_key]
+
+    # 2. Try direct pytz lookup (e.g. "America/Chicago")
+    if not matched_tz:
+        try:
+            pytz.timezone(user_input)
+            matched_tz = user_input
+        except pytz.exceptions.UnknownTimeZoneError:
+            pass
+
+    # 3. Fuzzy match against pytz timezone names
     if not matched_tz:
         search = user_input.lower().replace(' ', '_')
-        candidates = [tz for tz in _pytz.all_timezones if search in tz.lower()]
+        candidates = [tz for tz in pytz.all_timezones if search in tz.lower()]
         if candidates:
-            # Prefer exact city match (last part of tz string)
             exact = [tz for tz in candidates if tz.split('/')[-1].lower() == search]
             matched_tz = exact[0] if exact else candidates[0]
 
@@ -875,9 +947,9 @@ async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TY
             f"❌ Couldn't find timezone for *{user_input}*.\n\n"
             f"Try a major nearby city or use a timezone name like:\n"
             f"• Africa/Lagos\n"
-            f"• America/Sao_Paulo\n"
+            f"• America/Sao\_Paulo\n"
             f"• Asia/Kolkata\n\n"
-            f"Full list: en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+            f"Full list: en.wikipedia.org/wiki/List\_of\_tz\_database\_time\_zones",
             parse_mode='Markdown'
         )
 
@@ -925,6 +997,11 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     user_input = update.message.text
     user_id = update.effective_user.id
     timezone_str = get_user_timezone(user_id)
+
+    # Handle custom timezone input first (highest priority)
+    if context.user_data.get('awaiting_custom_tz'):
+        await custom_timezone_input(update, context)
+        return NATURAL_INPUT
 
     # If we're waiting for just the task name, capture it now
     if context.user_data.get('awaiting_name'):
