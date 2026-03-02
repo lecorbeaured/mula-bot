@@ -32,28 +32,54 @@ DB_FILE = os.path.join(DATA_DIR, "reminders.db")
 TOKEN = os.environ.get("TOKEN")
 
 TIMEZONE_MAP = {
-    'New York': 'America/New_York',
-    'Chicago': 'America/Chicago',
-    'Denver': 'America/Denver',
-    'Los Angeles': 'America/Los_Angeles',
-    'London': 'Europe/London',
-    'Paris': 'Europe/Paris',
-    'Berlin': 'Europe/Berlin',
-    'Moscow': 'Europe/Moscow',
-    'Tokyo': 'Asia/Tokyo',
-    'Shanghai': 'Asia/Shanghai',
-    'Dubai': 'Asia/Dubai',
-    'Singapore': 'Asia/Singapore',
-    'Sydney': 'Australia/Sydney',
-    'Auckland': 'Pacific/Auckland',
-    'UTC': 'UTC'
+    # Americas
+    'Honolulu (UTC-10)':     'Pacific/Honolulu',
+    'Anchorage (UTC-9)':     'America/Anchorage',
+    'Los Angeles (UTC-8)':   'America/Los_Angeles',
+    'Phoenix (UTC-7)':       'America/Phoenix',
+    'Denver (UTC-7)':        'America/Denver',
+    'Chicago (UTC-6)':       'America/Chicago',
+    'Mexico City (UTC-6)':   'America/Mexico_City',
+    'New York (UTC-5)':      'America/New_York',
+    'Toronto (UTC-5)':       'America/Toronto',
+    'Bogota (UTC-5)':        'America/Bogota',
+    'Caracas (UTC-4)':       'America/Caracas',
+    'Santiago (UTC-4)':      'America/Santiago',
+    'Buenos Aires (UTC-3)':  'America/Argentina/Buenos_Aires',
+    'Sao Paulo (UTC-3)':     'America/Sao_Paulo',
+    # Europe & Africa
+    'UTC':                   'UTC',
+    'London (UTC+0)':        'Europe/London',
+    'Lagos (UTC+1)':         'Africa/Lagos',
+    'Paris (UTC+1)':         'Europe/Paris',
+    'Berlin (UTC+1)':        'Europe/Berlin',
+    'Cairo (UTC+2)':         'Africa/Cairo',
+    'Johannesburg (UTC+2)':  'Africa/Johannesburg',
+    'Nairobi (UTC+3)':       'Africa/Nairobi',
+    'Moscow (UTC+3)':        'Europe/Moscow',
+    'Dubai (UTC+4)':         'Asia/Dubai',
+    # Asia & Pacific
+    'Karachi (UTC+5)':       'Asia/Karachi',
+    'Mumbai (UTC+5:30)':     'Asia/Kolkata',
+    'Dhaka (UTC+6)':         'Asia/Dhaka',
+    'Bangkok (UTC+7)':       'Asia/Bangkok',
+    'Singapore (UTC+8)':     'Asia/Singapore',
+    'Shanghai (UTC+8)':      'Asia/Shanghai',
+    'Tokyo (UTC+9)':         'Asia/Tokyo',
+    'Sydney (UTC+10)':       'Australia/Sydney',
+    'Auckland (UTC+12)':     'Pacific/Auckland',
 }
 
 TIMEZONE_DISPLAY = [
-    ['New York', 'Chicago', 'Denver', 'Los Angeles'],
-    ['London', 'Paris', 'Berlin', 'Moscow'],
-    ['Tokyo', 'Shanghai', 'Dubai', 'Singapore'],
-    ['Sydney', 'Auckland', 'UTC', 'Other...']
+    ['Honolulu (UTC-10)', 'Anchorage (UTC-9)', 'Los Angeles (UTC-8)', 'Phoenix (UTC-7)'],
+    ['Denver (UTC-7)', 'Chicago (UTC-6)', 'Mexico City (UTC-6)', 'New York (UTC-5)'],
+    ['Toronto (UTC-5)', 'Bogota (UTC-5)', 'Caracas (UTC-4)', 'Santiago (UTC-4)'],
+    ['Buenos Aires (UTC-3)', 'Sao Paulo (UTC-3)', 'UTC', 'London (UTC+0)'],
+    ['Lagos (UTC+1)', 'Paris (UTC+1)', 'Berlin (UTC+1)', 'Cairo (UTC+2)'],
+    ['Johannesburg (UTC+2)', 'Nairobi (UTC+3)', 'Moscow (UTC+3)', 'Dubai (UTC+4)'],
+    ['Karachi (UTC+5)', 'Mumbai (UTC+5:30)', 'Dhaka (UTC+6)', 'Bangkok (UTC+7)'],
+    ['Singapore (UTC+8)', 'Shanghai (UTC+8)', 'Tokyo (UTC+9)', 'Sydney (UTC+10)'],
+    ['Auckland (UTC+12)'],
 ]
 
 def init_db():
@@ -814,24 +840,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(tz, callback_data=f"tz_{tz}") for tz in row] for row in TIMEZONE_DISPLAY]
-    await msg_reply(update, "🌍 Select your city:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg_reply(update,
+        "🌍 *Select the city closest to you*\n"
+        "_Each city represents a timezone — pick any city in your same UTC offset_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
 
 async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     friendly_name = query.data.replace("tz_", "")
-
-    if friendly_name == "Other...":
-        await msg_edit(query,
-            "🌍 Type your city like this:\n\n"
-            "/settz Las Vegas\n"
-            "/settz Lagos\n"
-            "/settz Mumbai\n"
-            "/settz Sao Paulo\n"
-            "/settz America/Chicago"
-        )
-        return
 
     actual_tz = TIMEZONE_MAP.get(friendly_name, 'UTC')
     user_id = update.effective_user.id
