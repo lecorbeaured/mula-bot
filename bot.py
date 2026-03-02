@@ -140,6 +140,50 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # Column already exists, skip
 
+    # Backfill reminder_time_utc for tasks where it's NULL
+    # Also normalize malformed reminder_time values (e.g. "712pm" -> "19:12")
+    cursor.execute(
+        "SELECT id, user_id, reminder_time FROM tasks WHERE is_active=1"
+    )
+    tasks_to_fix = cursor.fetchall()
+    for task_id, user_id, raw_time in tasks_to_fix:
+        import re as _re
+        # Normalize "712pm" -> "7:12pm"
+        normalized = _re.sub(r'(\d{1,2})(\d{2})(am|pm)', r'\1:\2\3', raw_time, flags=_re.IGNORECASE)
+        # Parse to HH:MM 24h
+        try:
+            from datetime import datetime as _dt
+            if ':' in normalized:
+                t = _dt.strptime(normalized.strip().upper(), "%I:%M%p")
+            else:
+                t = _dt.strptime(normalized.strip().upper(), "%I%p")
+            hhmm = t.strftime("%H:%M")
+        except Exception:
+            hhmm = raw_time  # leave as-is if unparseable
+
+        # Update reminder_time to normalized HH:MM and backfill reminder_time_utc
+        # Use UTC as default timezone if user has none set
+        cursor.execute("SELECT timezone FROM users WHERE user_id=?", (user_id,))
+        tz_row = cursor.fetchone()
+        tz_str = tz_row[0] if tz_row else 'UTC'
+
+        import pytz as _pytz
+        from datetime import datetime as _dt2
+        try:
+            tz = _pytz.timezone(tz_str)
+            today = _dt2.now(tz).strftime('%Y-%m-%d')
+            local_dt = _dt2.strptime(f"{today} {hhmm}", "%Y-%m-%d %H:%M")
+            local_dt = tz.localize(local_dt)
+            utc_time = local_dt.astimezone(_pytz.UTC).strftime("%H:%M")
+        except Exception:
+            utc_time = hhmm
+
+        cursor.execute(
+            "UPDATE tasks SET reminder_time=?, reminder_time_utc=? WHERE id=?",
+            (hhmm, utc_time, task_id)
+        )
+    conn.commit()
+
     conn.close()
 
 init_db()
