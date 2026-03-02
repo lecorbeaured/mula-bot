@@ -905,10 +905,17 @@ async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle /settz CityName command"""
     user_id = update.effective_user.id
     args = context.args
+    # Fallback: extract city from raw message text if args is empty
     if not args:
-        await msg_reply(update, "Usage: /settz Las Vegas\nOr: /settz America/Chicago")
-        return
-    user_input = ' '.join(args).strip()
+        text = update.message.text or ""
+        parts = text.strip().split(None, 1)  # split on first whitespace
+        if len(parts) > 1:
+            user_input = parts[1].strip()
+        else:
+            await msg_reply(update, "Please include your city:\n/settz Las Vegas\n/settz Lagos\n/settz America/Chicago")
+            return
+    else:
+        user_input = ' '.join(args).strip()
 
     matched_tz = None
 
