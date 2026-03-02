@@ -53,7 +53,7 @@ TIMEZONE_DISPLAY = [
     ['New York', 'Chicago', 'Denver', 'Los Angeles'],
     ['London', 'Paris', 'Berlin', 'Moscow'],
     ['Tokyo', 'Shanghai', 'Dubai', 'Singapore'],
-    ['Sydney', 'Auckland', 'UTC']
+    ['Sydney', 'Auckland', 'UTC', 'Other...']
 ]
 
 def init_db():
@@ -809,15 +809,77 @@ async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     friendly_name = query.data.replace("tz_", "")
+
+    if friendly_name == "Other...":
+        context.user_data['awaiting_custom_tz'] = True
+        await msg_edit(query,
+            "🌍 Type your city or timezone name:\n\n"
+            "Examples:\n"
+            "• Lagos\n"
+            "• Nairobi\n"
+            "• Mumbai\n"
+            "• São Paulo\n"
+            "• America/Chicago\n"
+            "• Europe/Istanbul"
+        )
+        return
+
     actual_tz = TIMEZONE_MAP.get(friendly_name, 'UTC')
     user_id = update.effective_user.id
-    
+
     set_user_timezone(user_id, actual_tz)
     local_time = get_local_time(actual_tz)
-    
+
     await msg_edit(query, f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%I:%M %p')}")
+
+async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle free-text timezone input after user taps Other..."""
+    if not context.user_data.get('awaiting_custom_tz'):
+        return
+    
+    user_input = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    # Try to match input as a city name using pytz
+    import pytz as _pytz
+
+    # First try direct pytz lookup (e.g. "America/Chicago")
+    matched_tz = None
+    try:
+        _pytz.timezone(user_input)
+        matched_tz = user_input
+    except _pytz.exceptions.UnknownTimeZoneError:
+        pass
+
+    # Try fuzzy city match against all pytz timezones
+    if not matched_tz:
+        search = user_input.lower().replace(' ', '_')
+        candidates = [tz for tz in _pytz.all_timezones if search in tz.lower()]
+        if candidates:
+            # Prefer exact city match (last part of tz string)
+            exact = [tz for tz in candidates if tz.split('/')[-1].lower() == search]
+            matched_tz = exact[0] if exact else candidates[0]
+
+    if matched_tz:
+        set_user_timezone(user_id, matched_tz)
+        local_time = get_local_time(matched_tz)
+        context.user_data['awaiting_custom_tz'] = False
+        await msg_reply(update,
+            f"✅ Timezone set to: {matched_tz}\n"
+            f"🕐 Your time: {local_time.strftime('%I:%M %p')}"
+        )
+    else:
+        await msg_reply(update,
+            f"❌ Couldn't find timezone for *{user_input}*.\n\n"
+            f"Try a major nearby city or use a timezone name like:\n"
+            f"• Africa/Lagos\n"
+            f"• America/Sao_Paulo\n"
+            f"• Asia/Kolkata\n\n"
+            f"Full list: en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+            parse_mode='Markdown'
+        )
 
 async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg_reply(update,
@@ -1592,6 +1654,7 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('timezone', timezone_cmd))
     application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_timezone_input), group=1)
     application.add_handler(CommandHandler('list', list_tasks))
     application.add_handler(CommandHandler('delete', delete_start))
     application.add_handler(CommandHandler('stats', stats_cmd))
