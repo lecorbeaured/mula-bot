@@ -623,6 +623,14 @@ def utc_to_local(utc_time_str, timezone_str, date_str=None):
     except:
         return utc_time_str
 
+def fmt_time(time_str):
+    """Convert HH:MM (24h) to 12-hour format e.g. 2:45 PM"""
+    try:
+        from datetime import datetime as _dt
+        return _dt.strptime(time_str, "%H:%M").strftime("%-I:%M %p")
+    except:
+        return time_str
+
 def get_local_time(timezone_str):
     tz = pytz.timezone(timezone_str)
     return datetime.now(tz)
@@ -696,7 +704,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await msg_reply(update,
         f"👋 Hello {user.first_name}!\n\n"
-        f"🕐 Your time: {local_time.strftime('%H:%M')} ({friendly})\n\n"
+        f"🕐 Your time: {local_time.strftime('%-I:%M %p')} ({friendly})\n\n"
         f"📝 /add - Add task\n"
         f"   Examples:\n"
         f"   • 'Call John tomorrow at 3pm'\n"
@@ -757,7 +765,7 @@ async def _send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, task
     await msg_reply(update,
         f"📝 Task: {task_name}\n"
         f"📅 Date: {date_display}\n"
-        f"⏰ Time: {parsed['time']}\n"
+        f"⏰ Time: {fmt_time(parsed['time'])}\n"
         f"🔄 Type: {recurring_text}\n\n"
         f"Correct?",
         reply_markup=InlineKeyboardMarkup([
@@ -816,7 +824,7 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
                 next_valid = parsed_dt.replace(year=current_year + 1)
             await msg_reply(update,
                 f"❌ {parsed_year} has already passed!\n"
-                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {parsed['time']}?\n\n"
+                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {fmt_time(parsed['time'])}?\n\n"
                 f"Please re-enter with the correct year."
             )
         # Same year but date already passed
@@ -824,13 +832,13 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
             next_valid = parsed_dt.replace(year=current_year + 1)
             await msg_reply(update,
                 f"❌ {parsed['date']} has already passed this year!\n"
-                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {parsed['time']}?\n\n"
+                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {fmt_time(parsed['time'])}?\n\n"
                 f"Please re-enter with the correct date."
             )
         # Time today is in past
         else:
             await msg_reply(update,
-                f"❌ That time ({parsed['time']}) has already passed today!\n"
+                f"❌ That time ({fmt_time(parsed['time'])}) has already passed today!\n"
                 f"Try a future time, or specify tomorrow."
             )
         return NATURAL_INPUT
@@ -896,7 +904,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg_edit(query, 
         f"✅ Added!\n\n"
         f"📝 {task_name}\n"
-        f"⏰ {parsed['time']} {when}\n"
+        f"⏰ {fmt_time(parsed['time'])} {when}\n"
         f"{'🔁 ' + frequency if parsed['is_recurring'] else '☑️ One-time'}"
     )
     
@@ -924,7 +932,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif task.get('days_until') and task['days_until'] > 1:
                 date_info = f" ({task['days_until']} days)"
         
-        msg += f"{emoji}{date_info} {task['name']} at {task['time']}\n"
+        msg += f"{emoji}{date_info} {task['name']} at {fmt_time(task['time'])}\n"
     
     await msg_reply(update, msg)
 
@@ -991,7 +999,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
             await msg_send(
                 context.bot, chat_id,
-                f"🔔 {recurring_note}Reminder\n\n*{task_name}*\nYour time: {local_time}",
+                f"🔔 {recurring_note}Reminder\n\n*{task_name}*\nYour time: {fmt_time(local_time)}",
                 reply_markup=keyboard
             )
         except Exception as e:
