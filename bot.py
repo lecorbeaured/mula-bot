@@ -1375,15 +1375,6 @@ def stripe_webhook():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
 
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "<h1>PingBot</h1>"
-
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-
 def main():
     if not TOKEN:
         logger.error("No TOKEN!")
