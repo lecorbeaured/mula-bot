@@ -442,7 +442,16 @@ def parse_natural_date(text, timezone_str):
     }
     
     parsed = dateparser.parse(text_normalized, settings=settings)
-    
+
+    # If full text fails, try progressively stripping leading words
+    if not parsed:
+        words = text_normalized.split()
+        for i in range(1, len(words)):
+            partial = ' '.join(words[i:])
+            parsed = dateparser.parse(partial, settings=settings)
+            if parsed:
+                break
+
     if parsed:
         # Check if it's actually in the future
         if parsed > now:
