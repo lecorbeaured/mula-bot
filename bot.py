@@ -823,18 +823,13 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     friendly_name = query.data.replace("tz_", "")
 
     if friendly_name == "Other...":
-        user_id = update.effective_user.id
-        context.bot_data[f'awaiting_tz_{user_id}'] = True
         await msg_edit(query,
-            "🌍 Type your city or timezone name:\n\n"
-            "Examples:\n"
-            "• Las Vegas\n"
-            "• Lagos\n"
-            "• Nairobi\n"
-            "• Mumbai\n"
-            "• São Paulo\n"
-            "• America/Chicago\n"
-            "• Europe/Istanbul"
+            "🌍 Type your city like this:\n\n"
+            "/settz Las Vegas\n"
+            "/settz Lagos\n"
+            "/settz Mumbai\n"
+            "/settz Sao Paulo\n"
+            "/settz America/Chicago"
         )
         return
 
@@ -907,11 +902,13 @@ CITY_ALIASES = {
 }
 
 async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free-text timezone input after user taps Other..."""
+    """Handle /settz CityName command"""
     user_id = update.effective_user.id
-    if not context.bot_data.get(f'awaiting_tz_{user_id}'):
+    args = context.args
+    if not args:
+        await msg_reply(update, "Usage: /settz Las Vegas\nOr: /settz America/Chicago")
         return
-    user_input = update.message.text.strip()
+    user_input = ' '.join(args).strip()
 
     matched_tz = None
 
@@ -939,7 +936,6 @@ async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TY
     if matched_tz:
         set_user_timezone(user_id, matched_tz)
         local_time = get_local_time(matched_tz)
-        context.bot_data.pop(f'awaiting_tz_{user_id}', None)
         await msg_reply(update,
             f"✅ Timezone set to: {matched_tz}\n"
             f"🕐 Your time: {local_time.strftime('%I:%M %p')}"
@@ -1729,7 +1725,7 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('timezone', timezone_cmd))
     application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_timezone_input), group=1)
+    application.add_handler(CommandHandler('settz', custom_timezone_input))
     application.add_handler(CommandHandler('list', list_tasks))
     application.add_handler(CommandHandler('delete', delete_start))
     application.add_handler(CommandHandler('stats', stats_cmd))
