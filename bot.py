@@ -826,7 +826,25 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
             return NATURAL_INPUT
         context.user_data['task_name'] = task_name
         context.user_data['awaiting_name'] = False
-        # original_input already set when awaiting_name was triggered
+        return await _send_confirm(update, context, task_name, parsed)
+
+    # If we're waiting for a date/time after a task-name-only input
+    if context.user_data.get('awaiting_time'):
+        task_name = context.user_data.get('task_name_pending', '').strip()
+        user_input_normalized = normalize_time(user_input)
+        parsed = parse_natural_date(user_input_normalized, timezone_str)
+        if not parsed:
+            await msg_reply(update,
+                "❌ Still couldn't get the date/time. Try:\n"
+                "• tomorrow at 3pm\n"
+                "• March 31 at 2:45pm\n"
+                "• next Monday at 10am"
+            )
+            return NATURAL_INPUT
+        context.user_data['awaiting_time'] = False
+        context.user_data['task_name'] = task_name
+        context.user_data['parsed'] = parsed
+        context.user_data['original_input'] = user_input
         return await _send_confirm(update, context, task_name, parsed)
 
     # Normalize input
@@ -835,11 +853,18 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     parsed = parse_natural_date(user_input_normalized, timezone_str)
 
     if not parsed:
+        # No date/time found — save the input as the task name and ask for when
+        task_name_candidate = user_input.strip()
+        context.user_data['task_name_pending'] = task_name_candidate
+        context.user_data['awaiting_time'] = True
         await msg_reply(update,
-            "❌ Couldn't understand. Try:\n"
+            f"⏰ When should I remind you about *{task_name_candidate}*?\n\n"
+            "Examples:\n"
             "• tomorrow at 3pm\n"
             "• March 31 at 2:45pm\n"
-            "• next Monday at 10am"
+            "• next Monday at 10am\n"
+            "• every Friday at 9am",
+            parse_mode='Markdown'
         )
         return NATURAL_INPUT
 
@@ -1003,24 +1028,54 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
-    current_time = now.strftime("%H:%M")
     today = now.strftime("%Y-%m-%d")
-    
+
+    # Use a 2-minute window so a bot restart never silently drops a reminder
+    current_minute = now.strftime("%H:%M")
+    prev_minute = (now - timedelta(minutes=1)).strftime("%H:%M")
+    time_window = list({current_minute, prev_minute})
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+
+    # Dedup table so we never fire the same reminder twice in the window
     cursor.execute(
-        """SELECT t.id, t.user_id, t.task_name, COALESCE(u.timezone, 'UTC'), t.due_date, t.is_recurring 
-           FROM tasks t 
-           LEFT JOIN users u ON t.user_id = u.user_id 
-           WHERE t.reminder_time_utc = ? 
+        "CREATE TABLE IF NOT EXISTS reminders_sent "
+        "(task_id INTEGER, sent_date TEXT, sent_time TEXT, "
+        "PRIMARY KEY (task_id, sent_date, sent_time))"
+    )
+    conn.commit()
+
+    placeholders = ",".join("?" for _ in time_window)
+    cursor.execute(
+        f"""SELECT t.id, t.user_id, t.task_name, COALESCE(u.timezone, 'UTC'), t.due_date, t.is_recurring
+           FROM tasks t
+           LEFT JOIN users u ON t.user_id = u.user_id
+           WHERE t.reminder_time_utc IN ({placeholders})
            AND t.is_active = 1
-           AND (t.is_recurring = 1 OR t.due_date = ?)""",
-        (current_time, today)
+           AND (t.is_recurring = 1 OR t.due_date = ? OR t.due_date IS NULL)""",
+        (*time_window, today)
     )
     tasks = cursor.fetchall()
+
+    # Filter out already-sent reminders
+    due_tasks = []
+    for task in tasks:
+        task_id = task[0]
+        cursor.execute(
+            "SELECT 1 FROM reminders_sent WHERE task_id=? AND sent_date=?",
+            (task_id, today)
+        )
+        if not cursor.fetchone():
+            due_tasks.append(task)
+            cursor.execute(
+                "INSERT OR IGNORE INTO reminders_sent (task_id, sent_date, sent_time) VALUES (?,?,?)",
+                (task_id, today, current_minute)
+            )
+    conn.commit()
     conn.close()
     
-    for task in tasks:
+    for task in due_tasks:
         try:
             task_id, chat_id, task_name, tz, due_date, is_recurring = task
             local_time = utc_to_local(current_time, tz)
