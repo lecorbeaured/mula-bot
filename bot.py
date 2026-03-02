@@ -539,9 +539,20 @@ def parse_natural_date(text, timezone_str):
             'is_recurring': is_recurring
         }
     
-    # If dateparser worked but date is in past, try adding a year
+    # If dateparser worked but date is in past
     if parsed:
         if parsed <= now:
+            # Check if user explicitly typed a year — if so, don't auto-bump,
+            # let process_natural_input show a helpful error with the right suggestion
+            explicit_year = bool(re.search(r'\b(20\d{2})\b', text_normalized))
+            if explicit_year:
+                # Return as-is so the caller can detect it's in the past and warn the user
+                return {
+                    'datetime': parsed,
+                    'date': parsed.strftime('%Y-%m-%d'),
+                    'time': parsed.strftime('%H:%M'),
+                    'is_recurring': is_recurring
+                }
             try:
                 next_year_parsed = dateparser.parse(text_normalized + " next year", settings=settings)
                 if next_year_parsed and next_year_parsed > now:
