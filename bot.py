@@ -794,16 +794,33 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Check if date is in past (with 1 minute buffer)
     if parsed_dt < now - timedelta(minutes=1):
+        parsed_year = parsed_dt.year
+        current_year = now.year
         days_diff = (now - parsed_dt).days
-        if days_diff > 365:
+
+        # Explicit past year (e.g. March 31 2025 when it's 2026)
+        if parsed_year < current_year:
+            next_valid = parsed_dt.replace(year=current_year)
+            if next_valid < now:
+                next_valid = parsed_dt.replace(year=current_year + 1)
             await msg_reply(update,
-                f"❌ That date ({parsed['date']}) is in the past!\n"
-                f"Did you mean March 31, {now.year + 1}?"
+                f"❌ {parsed_year} has already passed!\n"
+                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {parsed['time']}?\n\n"
+                f"Please re-enter with the correct year."
             )
+        # Same year but date already passed
+        elif parsed_year == current_year and days_diff > 0:
+            next_valid = parsed_dt.replace(year=current_year + 1)
+            await msg_reply(update,
+                f"❌ {parsed['date']} has already passed this year!\n"
+                f"Did you mean {next_valid.strftime('%B %-d, %Y')} at {parsed['time']}?\n\n"
+                f"Please re-enter with the correct date."
+            )
+        # Time today is in past
         else:
             await msg_reply(update,
-                f"❌ That time ({parsed['date']} {parsed['time']}) is in the past!\n"
-                f"Try a future date/time."
+                f"❌ That time ({parsed['time']}) has already passed today!\n"
+                f"Try a future time, or specify tomorrow."
             )
         return NATURAL_INPUT
 
