@@ -125,6 +125,21 @@ def init_db():
     ''')
 
     conn.commit()
+
+    # Migrations: add columns that may be missing from older DBs
+    migrations = [
+        "ALTER TABLE tasks ADD COLUMN due_date TEXT",
+        "ALTER TABLE tasks ADD COLUMN is_recurring INTEGER DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN frequency TEXT DEFAULT 'once'",
+        "ALTER TABLE tasks ADD COLUMN reminder_time_utc TEXT",
+    ]
+    for sql in migrations:
+        try:
+            cursor.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists, skip
+
     conn.close()
 
 init_db()
@@ -145,7 +160,7 @@ async def msg_send(bot, chat_id, text, reply_markup=None, parse_mode='Markdown')
 
 async def msg_reply(update, text, reply_markup=None, parse_mode='Markdown'):
     """Reply to the current update's message."""
-    await msg_reply(update,
+    await update.message.reply_text(
         text,
         reply_markup=reply_markup,
         parse_mode=parse_mode
@@ -153,7 +168,7 @@ async def msg_reply(update, text, reply_markup=None, parse_mode='Markdown'):
 
 async def msg_edit(query, text, reply_markup=None, parse_mode='Markdown'):
     """Edit an existing inline message (callback query response)."""
-    await msg_edit(query, 
+    await query.edit_message_text(
         text,
         reply_markup=reply_markup,
         parse_mode=parse_mode
