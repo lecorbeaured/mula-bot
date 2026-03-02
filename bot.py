@@ -787,6 +787,7 @@ def delete_task_db(task_id, user_id):
     conn.close()
 
 (NATURAL_INPUT, CONFIRM) = range(2)
+CUSTOM_TZ_INPUT = 10  # separate state for custom timezone
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -822,10 +823,10 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     friendly_name = query.data.replace("tz_", "")
 
     if friendly_name == "Other...":
-        context.user_data['awaiting_custom_tz'] = True
         await msg_edit(query,
             "🌍 Type your city or timezone name:\n\n"
             "Examples:\n"
+            "• Las Vegas\n"
             "• Lagos\n"
             "• Nairobi\n"
             "• Mumbai\n"
@@ -833,7 +834,7 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• America/Chicago\n"
             "• Europe/Istanbul"
         )
-        return
+        return CUSTOM_TZ_INPUT
 
     actual_tz = TIMEZONE_MAP.get(friendly_name, 'UTC')
     user_id = update.effective_user.id
@@ -905,9 +906,6 @@ CITY_ALIASES = {
 
 async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle free-text timezone input after user taps Other..."""
-    if not context.user_data.get('awaiting_custom_tz'):
-        return
-
     user_input = update.message.text.strip()
     user_id = update.effective_user.id
 
@@ -937,11 +935,11 @@ async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TY
     if matched_tz:
         set_user_timezone(user_id, matched_tz)
         local_time = get_local_time(matched_tz)
-        context.user_data['awaiting_custom_tz'] = False
         await msg_reply(update,
             f"✅ Timezone set to: {matched_tz}\n"
             f"🕐 Your time: {local_time.strftime('%I:%M %p')}"
         )
+        return ConversationHandler.END
     else:
         await msg_reply(update,
             f"❌ Couldn't find timezone for *{user_input}*.\n\n"
@@ -952,6 +950,7 @@ async def custom_timezone_input(update: Update, context: ContextTypes.DEFAULT_TY
             f"Full list: en.wikipedia.org/wiki/List\_of\_tz\_database\_time\_zones",
             parse_mode='Markdown'
         )
+        return CUSTOM_TZ_INPUT
 
 async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg_reply(update,
@@ -997,11 +996,6 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     user_input = update.message.text
     user_id = update.effective_user.id
     timezone_str = get_user_timezone(user_id)
-
-    # Handle custom timezone input first (highest priority)
-    if context.user_data.get('awaiting_custom_tz'):
-        await custom_timezone_input(update, context)
-        return NATURAL_INPUT
 
     # If we're waiting for just the task name, capture it now
     if context.user_data.get('awaiting_name'):
@@ -1729,9 +1723,15 @@ def main():
     )
     
     application.add_handler(CommandHandler('start', start))
+    tz_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(timezone_callback, pattern='^tz_')],
+        states={
+            CUSTOM_TZ_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_timezone_input)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
     application.add_handler(CommandHandler('timezone', timezone_cmd))
-    application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_timezone_input), group=1)
+    application.add_handler(tz_conv)
     application.add_handler(CommandHandler('list', list_tasks))
     application.add_handler(CommandHandler('delete', delete_start))
     application.add_handler(CommandHandler('stats', stats_cmd))
