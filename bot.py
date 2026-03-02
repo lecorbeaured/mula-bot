@@ -1726,7 +1726,12 @@ def main():
             NATURAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_natural_input)],
             CONFIRM: [CallbackQueryHandler(confirm_callback)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CommandHandler('settz', custom_timezone_input),
+            CommandHandler('timezone', timezone_cmd),
+        ],
+        allow_reentry=True,
     )
     
     application.add_handler(CommandHandler('start', start))
