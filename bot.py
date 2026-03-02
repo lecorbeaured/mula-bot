@@ -25,7 +25,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_FILE = "reminders.db"
+import pathlib
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "reminders.db")
 TOKEN = os.environ.get("TOKEN")
 
 TIMEZONE_MAP = {
