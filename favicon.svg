@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="PingBot favicon">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#0EA5E9"/>
+    </linearGradient>
+    <linearGradient id="bellGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E0F2FE"/>
+    </linearGradient>
+    <filter id="softShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-color="#0369A1" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect width="32" height="32" rx="8" fill="url(#bgGrad)"/>
+
+  <!-- Subtle inner highlight -->
+  <rect width="32" height="14" rx="8" fill="white" opacity="0.08"/>
+
+  <!-- Bell body -->
+  <path
+    d="M16 5.5 C16 5.5 10 8 10 15 L10 20 L22 20 L22 15 C22 8 16 5.5 16 5.5 Z"
+    fill="url(#bellGrad)"
+    filter="url(#softShadow)"
+  />
+
+  <!-- Bell top knob -->
+  <circle cx="16" cy="5" r="2.2" fill="white"/>
+
+  <!-- Bell clapper / bottom dome -->
+  <path
+    d="M12.5 20 Q16 25.5 19.5 20 Z"
+    fill="white"
+  />
+
+  <!-- Vibration lines -->
+  <line x1="7" y1="13" x2="9.5" y2="14.5" stroke="white" stroke-width="1.5" stroke-linecap="round" opacity="0.7"/>
+  <line x1="25" y1="13" x2="22.5" y2="14.5" stroke="white" stroke-width="1.5" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Gold accent dot on bell (matches gold brand color) -->
+  <circle cx="16" cy="14" r="2" fill="#F59E0B" opacity="0.9"/>
+</svg>

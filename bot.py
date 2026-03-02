@@ -79,11 +79,298 @@ def init_db():
             timezone TEXT DEFAULT 'UTC'
         )
     ''')
-    
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            streak_current INTEGER DEFAULT 0,
+            streak_best INTEGER DEFAULT 0,
+            last_completed_date TEXT,
+            tasks_completed INTEGER DEFAULT 0
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS task_completions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            xp_earned INTEGER DEFAULT 0
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS badges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            badge_key TEXT NOT NULL,
+            earned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, badge_key)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            pro_status TEXT DEFAULT 'free',
+            pro_expires_at TEXT,
+            freeze_tokens INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
 init_db()
+
+# ── MESSAGING ABSTRACTION ─────────────────────────────────────────────────────
+# All outbound messages go through these functions.
+# To add a new platform (WhatsApp, SMS, Discord etc.), implement
+# the same interface here — the rest of the bot stays untouched.
+
+async def msg_send(bot, chat_id, text, reply_markup=None, parse_mode='Markdown'):
+    """Send a new message to a user."""
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode
+    )
+
+async def msg_reply(update, text, reply_markup=None, parse_mode='Markdown'):
+    """Reply to the current update's message."""
+    await msg_reply(update,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode
+    )
+
+async def msg_edit(query, text, reply_markup=None, parse_mode='Markdown'):
+    """Edit an existing inline message (callback query response)."""
+    await msg_edit(query, 
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode
+    )
+
+# ── END MESSAGING ABSTRACTION ─────────────────────────────────────────────────
+
+# ── GAMIFICATION ─────────────────────────────────────────────────────────────
+
+XP_PER_TASK = 10
+XP_PER_STREAK_BONUS = 5  # extra XP per streak day (stacks)
+
+LEVELS = [
+    (1,    0,    "🌱 Seedling"),
+    (2,    100,  "🌿 Sprout"),
+    (3,    250,  "🌳 Grower"),
+    (4,    500,  "⚡ Hustler"),
+    (5,    1000, "🔥 Grinder"),
+    (6,    2000, "💎 Diamond"),
+    (7,    4000, "👑 Legend"),
+]
+
+BADGES = {
+    "first_task":     ("🎯", "First Step",      "Completed your first task"),
+    "early_bird":     ("🌅", "Early Bird",       "Completed a task before 9 AM"),
+    "night_owl":      ("🦉", "Night Owl",        "Completed a task after 10 PM"),
+    "week_warrior":   ("🗡️", "Week Warrior",     "7-day streak"),
+    "month_master":   ("🏆", "Month Master",     "30-day streak"),
+    "century":        ("💯", "Century",          "Completed 100 tasks"),
+    "speed_runner":   ("⚡", "Speed Runner",     "Completed 5 tasks in one day"),
+    "consistent":     ("📅", "Consistent",       "3-day streak"),
+}
+
+def get_level(xp):
+    level_info = LEVELS[0]
+    for entry in LEVELS:
+        if xp >= entry[1]:
+            level_info = entry
+        else:
+            break
+    return level_info
+
+def xp_to_next_level(xp):
+    for i, entry in enumerate(LEVELS):
+        if xp < entry[1]:
+            return entry[1] - xp, entry[2]
+    return 0, LEVELS[-1][2]  # maxed out
+
+def get_or_create_stats(user_id, conn=None):
+    close = conn is None
+    if close:
+        conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM user_stats WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute("INSERT INTO user_stats (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        cursor.execute("SELECT * FROM user_stats WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+    if close:
+        conn.close()
+    cols = ['user_id','xp','level','streak_current','streak_best','last_completed_date','tasks_completed']
+    return dict(zip(cols, row))
+
+def award_xp(user_id, xp_amount, conn):
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE user_stats SET xp = xp + ?, tasks_completed = tasks_completed + 1 WHERE user_id = ?",
+        (xp_amount, user_id)
+    )
+
+def update_streak(user_id, conn):
+    """Update streak based on today's date. Returns (current_streak, is_new_day)."""
+    cursor = conn.cursor()
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    stats = get_or_create_stats(user_id, conn)
+    last = stats['last_completed_date']
+    streak = stats['streak_current']
+    best = stats['streak_best']
+
+    if last == today:
+        return streak, False  # already completed today
+
+    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+    if last == yesterday:
+        streak += 1
+    else:
+        streak = 1  # reset
+
+    best = max(best, streak)
+    cursor.execute(
+        """UPDATE user_stats 
+           SET streak_current = ?, streak_best = ?, last_completed_date = ?
+           WHERE user_id = ?""",
+        (streak, best, today, user_id)
+    )
+    return streak, True
+
+def check_and_award_badges(user_id, stats, conn):
+    """Check all badge conditions and award any newly earned ones. Returns list of new badge keys."""
+    cursor = conn.cursor()
+    new_badges = []
+
+    def earned(key):
+        cursor.execute("SELECT 1 FROM badges WHERE user_id = ? AND badge_key = ?", (user_id, key))
+        return cursor.fetchone() is not None
+
+    def award(key):
+        try:
+            cursor.execute("INSERT INTO badges (user_id, badge_key) VALUES (?, ?)", (user_id, key))
+            new_badges.append(key)
+        except sqlite3.IntegrityError:
+            pass
+
+    if stats['tasks_completed'] >= 1 and not earned("first_task"):
+        award("first_task")
+    if stats['tasks_completed'] >= 100 and not earned("century"):
+        award("century")
+    if stats['streak_current'] >= 3 and not earned("consistent"):
+        award("consistent")
+    if stats['streak_current'] >= 7 and not earned("week_warrior"):
+        award("week_warrior")
+    if stats['streak_current'] >= 30 and not earned("month_master"):
+        award("month_master")
+
+    # Time-based badges checked separately in check_reminders via local time
+    return new_badges
+
+def get_all_badges(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT badge_key, earned_at FROM badges WHERE user_id = ?", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def format_badge_notifications(new_badge_keys):
+    if not new_badge_keys:
+        return ""
+    lines = ["\n🏅 *New Badge(s) Unlocked!*"]
+    for key in new_badge_keys:
+        b = BADGES.get(key)
+        if b:
+            lines.append(f"  {b[0]} *{b[1]}* — {b[2]}")
+    return "\n".join(lines)
+
+def complete_task(user_id, task_id, local_hour=None):
+    """Record task completion, update XP/streak/badges. Returns result dict."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        get_or_create_stats(user_id, conn)
+        streak, is_new_day = update_streak(user_id, conn)
+
+        # XP = base + streak bonus (Pro gets 1.5x)
+        base_xp = XP_PER_TASK + (streak - 1) * XP_PER_STREAK_BONUS
+        multiplier = PRO_XP_MULTIPLIER if is_pro(user_id) else 1.0
+        xp_earned = int(base_xp * multiplier)
+        award_xp(user_id, xp_earned, conn)
+
+        # Log completion
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO task_completions (user_id, task_id, xp_earned) VALUES (?, ?, ?)",
+            (user_id, task_id, xp_earned)
+        )
+
+        # Check daily task count for speed runner badge
+        today = datetime.utcnow().strftime('%Y-%m-%d')
+        cursor.execute(
+            "SELECT COUNT(*) FROM task_completions WHERE user_id = ? AND DATE(completed_at) = ?",
+            (user_id, today)
+        )
+        daily_count = cursor.fetchone()[0]
+
+        stats = get_or_create_stats(user_id, conn)
+        new_badges = check_and_award_badges(user_id, stats, conn)
+
+        # Time-based badges
+        if local_hour is not None:
+            if local_hour < 9 and "early_bird" not in [b for b in new_badges]:
+                try:
+                    cursor.execute("INSERT INTO badges (user_id, badge_key) VALUES (?, ?)", (user_id, "early_bird"))
+                    new_badges.append("early_bird")
+                except sqlite3.IntegrityError:
+                    pass
+            if local_hour >= 22:
+                try:
+                    cursor.execute("INSERT INTO badges (user_id, badge_key) VALUES (?, ?)", (user_id, "night_owl"))
+                    new_badges.append("night_owl")
+                except sqlite3.IntegrityError:
+                    pass
+
+        if daily_count >= 5 and "speed_runner" not in new_badges:
+            try:
+                cursor.execute("INSERT INTO badges (user_id, badge_key) VALUES (?, ?)", (user_id, "speed_runner"))
+                new_badges.append("speed_runner")
+            except sqlite3.IntegrityError:
+                pass
+
+        conn.commit()
+        stats = get_or_create_stats(user_id, conn)
+        level_info = get_level(stats['xp'])
+
+        return {
+            'xp_earned': xp_earned,
+            'total_xp': stats['xp'],
+            'level': level_info,
+            'streak': streak,
+            'is_new_day': is_new_day,
+            'new_badges': new_badges,
+            'tasks_completed': stats['tasks_completed'],
+        }
+    finally:
+        conn.close()
+
+# ── END GAMIFICATION ──────────────────────────────────────────────────────────
 
 def get_user_timezone(user_id):
     conn = sqlite3.connect(DB_FILE)
@@ -230,19 +517,19 @@ def parse_natural_date(text, timezone_str):
     
     # If dateparser worked but date is in past, try adding a year
     if parsed:
-        # If the parsed date is in the past, assume next year
         if parsed <= now:
             try:
-                # Try to parse with explicit year handling
-                settings['PREFER_DATES_FROM'] = 'future'
-                settings['STRICT_PARSING'] = False
-                parsed = dateparser.parse(text_normalized + " next year", settings=settings)
-                if not parsed or parsed <= now:
-                    # Just add one year manually
-                    parsed = parsed.replace(year=parsed.year + 1) if parsed else None
-            except:
+                next_year_parsed = dateparser.parse(text_normalized + " next year", settings=settings)
+                if next_year_parsed and next_year_parsed > now:
+                    parsed = next_year_parsed
+                else:
+                    # Manually bump year
+                    bumped = parsed.replace(year=parsed.year + 1)
+                    if bumped > now:
+                        parsed = bumped
+            except Exception:
                 pass
-        
+
         if parsed and parsed > now:
             return {
                 'datetime': parsed,
@@ -289,12 +576,12 @@ def local_to_utc(time_str, date_str, timezone_str):
     except:
         return time_str
 
-def utc_to_local(utc_time_str, timezone_str):
+def utc_to_local(utc_time_str, timezone_str, date_str=None):
     try:
         utc = pytz.UTC
         tz = pytz.timezone(timezone_str)
-        today = datetime.now(utc).strftime('%Y-%m-%d')
-        utc_dt = datetime.strptime(f"{today} {utc_time_str}", "%Y-%m-%d %H:%M")
+        ref_date = date_str or datetime.now(utc).strftime('%Y-%m-%d')
+        utc_dt = datetime.strptime(f"{ref_date} {utc_time_str}", "%Y-%m-%d %H:%M")
         utc_dt = utc.localize(utc_dt)
         local_dt = utc_dt.astimezone(tz)
         return local_dt.strftime("%H:%M")
@@ -323,7 +610,7 @@ def get_tasks(user_id):
     
     tasks = []
     for row in rows:
-        local_time = utc_to_local(row[3] or row[2], timezone_str)
+        local_time = utc_to_local(row[3] or row[2], timezone_str, date_str=row[4])
         due = row[4]
         days_until = None
         
@@ -372,7 +659,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     friendly = get_friendly_name(tz)
     local_time = get_local_time(tz)
     
-    await update.message.reply_text(
+    await msg_reply(update,
         f"👋 Hello {user.first_name}!\n\n"
         f"🕐 Your time: {local_time.strftime('%H:%M')} ({friendly})\n\n"
         f"📝 /add - Add task\n"
@@ -382,12 +669,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   • 'Pay rent March 31 at 2:45pm'\n\n"
         f"🌍 /timezone - Change city\n"
         f"📋 /list - View tasks\n"
-        f"❌ /delete - Remove task"
+        f"❌ /delete - Remove task\n\n"
+        f"⚡ /stats - XP, level & streak\n"
+        f"🏅 /badges - Your achievements\n\n"
+        f"💎 /upgrade - Go Pro ($8/mo)\n"
+        f"🧊 /freeze - Protect your streak (Pro)"
     )
 
 async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(tz, callback_data=f"tz_{tz}") for tz in row] for row in TIMEZONE_DISPLAY]
-    await update.message.reply_text("🌍 Select your city:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg_reply(update, "🌍 Select your city:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -400,10 +691,10 @@ async def timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_user_timezone(user_id, actual_tz)
     local_time = get_local_time(actual_tz)
     
-    await query.edit_message_text(f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%H:%M %p')}")
+    await msg_edit(query, f"✅ Timezone: {friendly_name}\n🕐 Your time: {local_time.strftime('%I:%M %p')}")
 
 async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await msg_reply(update,
         "📝 What should I remind you about?\n\n"
         "Examples:\n"
         "• Call John tomorrow at 3pm\n"
@@ -413,59 +704,11 @@ async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return NATURAL_INPUT
 
-async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text
-    user_id = update.effective_user.id
-    timezone_str = get_user_timezone(user_id)
-    
-    # Normalize input
-    user_input_normalized = normalize_time(user_input)
-    
-    parsed = parse_natural_date(user_input_normalized, timezone_str)
-    
-    if not parsed:
-        await update.message.reply_text(
-            "❌ Couldn't understand. Try:\n"
-            "• tomorrow at 3pm\n"
-            "• March 31 at 2:45pm\n"
-            "• next Monday at 10am"
-        )
-        return NATURAL_INPUT
-    
-    user_tz = pytz.timezone(timezone_str)
-    now = datetime.now(user_tz)
-    parsed_dt = parsed['datetime']
-    
-    # Check if date is in past (with 1 minute buffer)
-    if parsed_dt < now - timedelta(minutes=1):
-        # If it's a specific date without year, maybe they meant next year
-        days_diff = (now - parsed_dt).days
-        if days_diff > 365:
-            await update.message.reply_text(
-                f"❌ That date ({parsed['date']}) is in the past!\n"
-                f"Did you mean March 31, {now.year + 1}?"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ That time ({parsed['date']} {parsed['time']}) is in the past!\n"
-                f"Try a future date/time."
-            )
-        return NATURAL_INPUT
-    
-    task_name = extract_task_name(user_input)
-    
-    if not task_name or task_name == user_input:
-        await update.message.reply_text("What's the task? (e.g., 'Pay rent')")
-        context.user_data['parsed'] = parsed
-        context.user_data['awaiting_name'] = True
-        return NATURAL_INPUT
-    
-    context.user_data['task_name'] = task_name
-    context.user_data['parsed'] = parsed
-    
+async def _send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, task_name: str, parsed: dict):
+    """Show confirmation message with task details."""
     date_obj = datetime.strptime(parsed['date'], '%Y-%m-%d')
     today = datetime.now().strftime('%Y-%m-%d')
-    
+
     if parsed['date'] == today:
         date_display = "Today"
     elif parsed['date'] == (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'):
@@ -473,10 +716,10 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         days_until = (date_obj - datetime.now()).days
         date_display = f"{parsed['date']} (in {days_until} days)"
-    
+
     recurring_text = "🔁 Recurring" if parsed['is_recurring'] else "☑️ One-time"
-    
-    await update.message.reply_text(
+
+    await msg_reply(update,
         f"📝 Task: {task_name}\n"
         f"📅 Date: {date_display}\n"
         f"⏰ Time: {parsed['time']}\n"
@@ -489,6 +732,72 @@ async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TY
     )
     return CONFIRM
 
+
+async def process_natural_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text
+    user_id = update.effective_user.id
+    timezone_str = get_user_timezone(user_id)
+
+    # If we're waiting for just the task name, capture it now
+    if context.user_data.get('awaiting_name'):
+        task_name = user_input.strip()
+        parsed = context.user_data.get('parsed')
+        if not task_name or not parsed:
+            await msg_reply(update, "Please enter a task name (e.g., 'Pay rent').")
+            return NATURAL_INPUT
+        context.user_data['task_name'] = task_name
+        context.user_data['awaiting_name'] = False
+        # original_input already set when awaiting_name was triggered
+        return await _send_confirm(update, context, task_name, parsed)
+
+    # Normalize input
+    user_input_normalized = normalize_time(user_input)
+
+    parsed = parse_natural_date(user_input_normalized, timezone_str)
+
+    if not parsed:
+        await msg_reply(update,
+            "❌ Couldn't understand. Try:\n"
+            "• tomorrow at 3pm\n"
+            "• March 31 at 2:45pm\n"
+            "• next Monday at 10am"
+        )
+        return NATURAL_INPUT
+
+    user_tz = pytz.timezone(timezone_str)
+    now = datetime.now(user_tz)
+    parsed_dt = parsed['datetime']
+
+    # Check if date is in past (with 1 minute buffer)
+    if parsed_dt < now - timedelta(minutes=1):
+        days_diff = (now - parsed_dt).days
+        if days_diff > 365:
+            await msg_reply(update,
+                f"❌ That date ({parsed['date']}) is in the past!\n"
+                f"Did you mean March 31, {now.year + 1}?"
+            )
+        else:
+            await msg_reply(update,
+                f"❌ That time ({parsed['date']} {parsed['time']}) is in the past!\n"
+                f"Try a future date/time."
+            )
+        return NATURAL_INPUT
+
+    task_name = extract_task_name(user_input)
+
+    if not task_name or task_name == user_input:
+        await msg_reply(update, "What's the task name? (e.g., 'Pay rent')")
+        context.user_data['parsed'] = parsed
+        context.user_data['original_input'] = user_input
+        context.user_data['awaiting_name'] = True
+        return NATURAL_INPUT
+
+    context.user_data['task_name'] = task_name
+    context.user_data['parsed'] = parsed
+    context.user_data['original_input'] = user_input
+
+    return await _send_confirm(update, context, task_name, parsed)
+
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle both Yes and Cancel buttons"""
     query = update.callback_query
@@ -497,7 +806,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if query.data == 'cancel':
-        await query.edit_message_text("❌ Cancelled")
+        await msg_edit(query, "❌ Cancelled")
         context.user_data.clear()
         return ConversationHandler.END
     
@@ -505,7 +814,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
     
     if not data.get('parsed'):
-        await query.edit_message_text("❌ Error: No task data found")
+        await msg_edit(query, "❌ Error: No task data found")
         return ConversationHandler.END
     
     task_name = data.get('task_name', 'Task')
@@ -513,11 +822,11 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     frequency = 'once'
     if parsed['is_recurring']:
-        text_lower = task_name.lower()
-        if 'week' in text_lower:
-            frequency = 'weekly'
-        elif 'month' in text_lower:
+        original = data.get('original_input', '').lower()
+        if 'month' in original:
             frequency = 'monthly'
+        elif 'week' in original:
+            frequency = 'weekly'
         else:
             frequency = 'daily'
     
@@ -532,7 +841,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     when = "starting " + parsed['date'] if parsed['is_recurring'] else "on " + parsed['date']
     
-    await query.edit_message_text(
+    await msg_edit(query, 
         f"✅ Added!\n\n"
         f"📝 {task_name}\n"
         f"⏰ {parsed['time']} {when}\n"
@@ -547,7 +856,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = get_tasks(user_id)
     
     if not tasks:
-        await update.message.reply_text("No tasks! Add one with /add")
+        await msg_reply(update, "No tasks! Add one with /add")
         return
     
     msg = "📋 Your Tasks:\n\n"
@@ -565,14 +874,14 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         msg += f"{emoji}{date_info} {task['name']} at {task['time']}\n"
     
-    await update.message.reply_text(msg)
+    await msg_reply(update, msg)
 
 async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tasks = get_tasks(user_id)
     
     if not tasks:
-        await update.message.reply_text("No tasks to delete!")
+        await msg_reply(update, "No tasks to delete!")
         return
     
     keyboard = []
@@ -580,7 +889,7 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = "🔁" if task['is_recurring'] else "☑️"
         keyboard.append([InlineKeyboardButton(f"{emoji} {task['name']}", callback_data=f"del_{task['id']}")])
     
-    await update.message.reply_text("Delete which?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await msg_reply(update, "Delete which?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -590,10 +899,10 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     delete_task_db(task_id, user_id)
-    await query.edit_message_text("🗑️ Deleted!")
+    await msg_edit(query, "🗑️ Deleted!")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled")
+    await msg_reply(update, "❌ Cancelled")
     return ConversationHandler.END
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -604,9 +913,9 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        """SELECT t.id, t.user_id, t.task_name, u.timezone, t.due_date, t.is_recurring 
+        """SELECT t.id, t.user_id, t.task_name, COALESCE(u.timezone, 'UTC'), t.due_date, t.is_recurring 
            FROM tasks t 
-           JOIN users u ON t.user_id = u.user_id 
+           LEFT JOIN users u ON t.user_id = u.user_id 
            WHERE t.reminder_time_utc = ? 
            AND t.is_active = 1
            AND (t.is_recurring = 1 OR t.due_date = ?)""",
@@ -617,21 +926,460 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     
     for task in tasks:
         try:
-            local_time = utc_to_local(current_time, task[3])
-            recurring_note = "🔁 " if task[5] else ""
-            
-            await context.bot.send_message(
-                chat_id=task[1],
-                text=f"🔔 {recurring_note}Reminder\n\n{task[2]}\nYour time: {local_time}"
+            task_id, chat_id, task_name, tz, due_date, is_recurring = task
+            local_time = utc_to_local(current_time, tz)
+            recurring_note = "🔁 " if is_recurring else ""
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Done", callback_data=f"done_{task_id}"),
+                    InlineKeyboardButton("⏭ Skip", callback_data=f"skip_{task_id}"),
+                ]
+            ])
+
+            await msg_send(
+                context.bot, chat_id,
+                f"🔔 {recurring_note}Reminder\n\n*{task_name}*\nYour time: {local_time}",
+                reply_markup=keyboard
             )
         except Exception as e:
             logger.error(f"Failed: {e}")
+
+# ── PRO SUBSCRIPTION ──────────────────────────────────────────────────────────
+
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID      = os.environ.get("STRIPE_PRICE_ID", "")   # $8/mo price ID
+BOT_USERNAME         = os.environ.get("BOT_USERNAME", "ping_bot")
+WEBAPP_URL           = os.environ.get("WEBAPP_URL", "")         # e.g. https://yourapp.railway.app
+
+PRO_XP_MULTIPLIER   = 1.5
+PRO_FREEZE_ALLOTMENT = 2   # freeze tokens granted per billing period
+PRO_MONTHLY_PRICE   = 8
+
+def init_stripe():
+    if STRIPE_SECRET_KEY:
+        import stripe as _stripe
+        _stripe.api_key = STRIPE_SECRET_KEY
+        return _stripe
+    return None
+
+def is_pro(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT pro_status, pro_expires_at FROM subscriptions
+           WHERE user_id = ? AND pro_status = 'active'
+           AND (pro_expires_at IS NULL OR pro_expires_at > ?)""",
+        (user_id, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+def get_subscription(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM subscriptions WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = ['user_id','stripe_customer_id','stripe_subscription_id',
+            'pro_status','pro_expires_at','freeze_tokens','created_at']
+    return dict(zip(cols, row))
+
+def set_pro_active(user_id, customer_id, subscription_id, expires_at=None):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO subscriptions
+               (user_id, stripe_customer_id, stripe_subscription_id, pro_status, pro_expires_at, freeze_tokens)
+           VALUES (?, ?, ?, 'active', ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               stripe_customer_id=excluded.stripe_customer_id,
+               stripe_subscription_id=excluded.stripe_subscription_id,
+               pro_status='active',
+               pro_expires_at=excluded.pro_expires_at,
+               freeze_tokens=CASE WHEN freeze_tokens < ? THEN ? ELSE freeze_tokens END""",
+        (user_id, customer_id, subscription_id, expires_at,
+         PRO_FREEZE_ALLOTMENT, PRO_FREEZE_ALLOTMENT, PRO_FREEZE_ALLOTMENT)
+    )
+    conn.commit()
+    conn.close()
+
+def set_pro_cancelled(user_id, expires_at):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """UPDATE subscriptions SET pro_status='cancelled', pro_expires_at=?
+           WHERE user_id=?""",
+        (expires_at, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+def use_freeze_token(user_id):
+    """Use one freeze token to protect today's streak. Returns True if used successfully."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT freeze_tokens FROM subscriptions WHERE user_id=? AND pro_status='active'",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    if not row or row[0] < 1:
+        conn.close()
+        return False
+    # Mark today as completed to protect streak without actual task completion
+    cursor.execute(
+        """UPDATE user_stats SET last_completed_date=? WHERE user_id=?""",
+        (datetime.utcnow().strftime('%Y-%m-%d'), user_id)
+    )
+    cursor.execute(
+        "UPDATE subscriptions SET freeze_tokens=freeze_tokens-1 WHERE user_id=?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+def get_freeze_tokens(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT freeze_tokens FROM subscriptions WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+# ── END PRO SUBSCRIPTION ──────────────────────────────────────────────────────
+# ── GAMIFICATION COMMANDS ─────────────────────────────────────────────────────
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    stats = get_or_create_stats(user_id)
+    level_info = get_level(stats['xp'])
+    xp_needed, next_level_name = xp_to_next_level(stats['xp'])
+
+    streak_fire = "🔥" * min(stats['streak_current'], 5)
+    if not streak_fire:
+        streak_fire = "—"
+
+    if xp_needed > 0:
+        progress_line = f"📈 {stats['xp']} XP → {xp_needed} XP to {next_level_name}"
+    else:
+        progress_line = f"📈 {stats['xp']} XP — Max level reached! 👑"
+
+    await msg_reply(update,
+        f"⚡ *Your Stats*\n\n"
+        f"🏅 Level: {level_info[2]}\n"
+        f"{progress_line}\n\n"
+        f"🔥 Streak: {stats['streak_current']} day(s) {streak_fire}\n"
+        f"🏆 Best Streak: {stats['streak_best']} days\n"
+        f"✅ Tasks Done: {stats['tasks_completed']}"
+        + (f"\n\n💎 *Pro Member* · 🧊 {get_freeze_tokens(user_id)} freeze token(s)" if is_pro(user_id) else "\n\n⬆️ /upgrade for Pro perks"),
+        parse_mode='Markdown'
+    )
+
+async def badges_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    earned = get_all_badges(user_id)
+    earned_keys = {row[0] for row in earned}
+
+    lines = ["🏅 *Your Badges*\n"]
+    for key, (emoji, name, desc) in BADGES.items():
+        if key in earned_keys:
+            lines.append(f"{emoji} *{name}* — {desc}")
+        else:
+            lines.append(f"🔒 ~~{name}~~ — {desc}")
+
+    await msg_reply(update, "\n".join(lines), parse_mode='Markdown')
+
+async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ✅ Done button on reminders."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    task_id = int(query.data.split('_')[1])
+    timezone_str = get_user_timezone(user_id)
+    local_hour = datetime.now(pytz.timezone(timezone_str)).hour
+
+    result = complete_task(user_id, task_id, local_hour=local_hour)
+
+    streak_text = ""
+    if result['is_new_day']:
+        if result['streak'] > 1:
+            streak_text = f"\n🔥 Streak: {result['streak']} days!"
+        else:
+            streak_text = "\n🔥 Streak started!"
+
+    badge_text = format_badge_notifications(result['new_badges'])
+    level_name = result['level'][2]
+
+    await msg_edit(query, 
+        f"✅ *Done!* +{result['xp_earned']} XP{streak_text}\n"
+        f"⚡ {result['total_xp']} XP · {level_name}"
+        f"{badge_text}",
+        parse_mode='Markdown'
+    )
+
+async def skip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ⏭ Skip button on reminders (no XP penalty, just dismiss)."""
+    query = update.callback_query
+    await query.answer()
+    await msg_edit(query, "⏭ Skipped.")
+
+# ── END GAMIFICATION COMMANDS ─────────────────────────────────────────────────
+
+# ── PRO COMMANDS ──────────────────────────────────────────────────────────────
+
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_pro(user_id):
+        sub = get_subscription(user_id)
+        tokens = sub['freeze_tokens'] if sub else 0
+        expires = sub['pro_expires_at'] if sub else "—"
+        await msg_reply(update,
+            f"💎 *You're already Pro!*\n\n"
+            f"🧊 Freeze tokens: {tokens}\n"
+            f"📅 Renews: {expires or 'Monthly'}\n\n"
+            f"Use /freeze to protect your streak on a rest day.\n"
+            f"Use /cancel_pro to cancel your subscription.",
+            parse_mode='Markdown'
+        )
+        return
+
+    stripe = init_stripe()
+    if not stripe or not STRIPE_PRICE_ID or not WEBAPP_URL:
+        # Fallback: no Stripe configured yet
+        await msg_reply(update,
+            f"💎 *PingBot Pro — ${PRO_MONTHLY_PRICE}/month*\n\n"
+            f"✨ *Pro features:*\n"
+            f"• 🧊 Streak Freeze (2 tokens/mo) — protect your streak on rest days\n"
+            f"• ⚡ 1.5x XP on every task\n"
+            f"• 🤖 AI goal breakdown — split big goals into daily steps\n"
+            f"• 💎 Exclusive Pro badge\n\n"
+            f"_Stripe not yet configured. Set STRIPE_SECRET_KEY, STRIPE_PRICE_ID, and WEBAPP_URL env vars._",
+            parse_mode='Markdown'
+        )
+        return
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='subscription',
+            line_items=[{'price': STRIPE_PRICE_ID, 'quantity': 1}],
+            success_url=f"{WEBAPP_URL}/success?session_id={{CHECKOUT_SESSION_ID}}&user_id={user_id}",
+            cancel_url=f"{WEBAPP_URL}/cancel",
+            metadata={'telegram_user_id': str(user_id)},
+            client_reference_id=str(user_id),
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Subscribe for $8/mo", url=session.url)]
+        ])
+        await msg_reply(update,
+            f"💎 *PingBot Pro — ${PRO_MONTHLY_PRICE}/month*\n\n"
+            f"✨ *What you get:*\n"
+            f"• 🧊 Streak Freeze tokens (2/mo)\n"
+            f"• ⚡ 1.5× XP multiplier\n"
+            f"• 🤖 AI goal breakdown\n"
+            f"• 💎 Exclusive Pro badge\n\n"
+            f"Tap below to subscribe securely via Stripe:",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Stripe session error: {e}")
+        await msg_reply(update, "❌ Payment link failed. Try again later.")
+
+
+async def cancel_pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_pro(user_id):
+        await msg_reply(update, "You don't have an active Pro subscription.")
+        return
+
+    stripe = init_stripe()
+    sub = get_subscription(user_id)
+    if stripe and sub and sub['stripe_subscription_id']:
+        try:
+            stripe_sub = stripe.Subscription.modify(
+                sub['stripe_subscription_id'],
+                cancel_at_period_end=True
+            )
+            period_end = datetime.utcfromtimestamp(
+                stripe_sub['current_period_end']
+            ).strftime('%Y-%m-%d')
+            set_pro_cancelled(user_id, period_end)
+            await msg_reply(update,
+                f"✅ Subscription cancelled.\n"
+                f"You keep Pro access until *{period_end}*.",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Cancel error: {e}")
+            await msg_reply(update, "❌ Cancellation failed. Try again later.")
+    else:
+        await msg_reply(update,
+            "⚠️ Contact support to cancel — no Stripe ID found."
+        )
+
+
+async def freeze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_pro(user_id):
+        await msg_reply(update,
+            "🧊 Streak Freeze is a *Pro* feature.\n"
+            "Upgrade with /upgrade to protect your streak on rest days.",
+            parse_mode='Markdown'
+        )
+        return
+
+    tokens = get_freeze_tokens(user_id)
+    if tokens < 1:
+        await msg_reply(update,
+            "🧊 No freeze tokens left this month.\n"
+            "You get 2 fresh tokens on your next billing date."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧊 Yes, freeze today", callback_data="freeze_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="freeze_cancel"),
+        ]
+    ])
+    await msg_reply(update,
+        f"🧊 *Streak Freeze*\n\n"
+        f"This will protect your streak for today without completing a task.\n"
+        f"Tokens remaining: {tokens}\n\n"
+        f"Use one now?",
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+
+async def freeze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if query.data == "freeze_cancel":
+        await msg_edit(query, "❌ Cancelled.")
+        return
+
+    success = use_freeze_token(user_id)
+    if success:
+        tokens_left = get_freeze_tokens(user_id)
+        stats = get_or_create_stats(user_id)
+        await msg_edit(query, 
+            f"🧊 *Streak frozen!*\n\n"
+            f"🔥 Streak protected: {stats['streak_current']} days\n"
+            f"Tokens remaining: {tokens_left}",
+            parse_mode='Markdown'
+        )
+    else:
+        await msg_edit(query, "❌ No freeze tokens available.")
+
+
+async def pro_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show Pro status inline in /stats if applicable."""
+    pass  # Handled inside stats_cmd
+
+# ── END PRO COMMANDS ──────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "<h1>Mula Bot - Fixed Parser</h1>"
+    return "<h1>PingBot</h1><p><a href='/status'>Status</a></p>"
+
+@app.route('/status')
+def status():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE is_active=1")
+    tasks = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM subscriptions WHERE pro_status='active'")
+    pros = cursor.fetchone()[0]
+    conn.close()
+    return f"<h2>PingBot Status</h2><p>Users: {users} | Active tasks: {tasks} | Pro members: {pros}</p>"
+
+@app.route('/success')
+def stripe_success():
+    return "<h2>✅ Payment successful!</h2><p>Return to Telegram and send /stats to see your Pro status.</p>"
+
+@app.route('/cancel')
+def stripe_cancel():
+    return "<h2>Payment cancelled.</h2><p>Return to Telegram whenever you're ready to upgrade.</p>"
+
+@app.route('/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    import stripe as _stripe
+    from flask import request, jsonify
+    _stripe.api_key = STRIPE_SECRET_KEY
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature', '')
+    try:
+        event = _stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({'error': str(e)}), 400
+
+    etype = event['type']
+    data = event['data']['object']
+
+    if etype == 'checkout.session.completed':
+        user_id = int(data.get('client_reference_id', 0))
+        customer_id = data.get('customer', '')
+        subscription_id = data.get('subscription', '')
+        if user_id:
+            set_pro_active(user_id, customer_id, subscription_id)
+            logger.info(f"Pro activated for user {user_id}")
+
+    elif etype in ('customer.subscription.updated', 'invoice.paid'):
+        subscription_id = data.get('id') or data.get('subscription', '')
+        customer_id = data.get('customer', '')
+        # Find user by subscription ID
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id FROM subscriptions WHERE stripe_subscription_id=? OR stripe_customer_id=?",
+            (subscription_id, customer_id)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            period_end = data.get('current_period_end')
+            expires = datetime.utcfromtimestamp(period_end).strftime('%Y-%m-%d %H:%M:%S') if period_end else None
+            set_pro_active(row[0], customer_id, subscription_id, expires)
+
+    elif etype == 'customer.subscription.deleted':
+        customer_id = data.get('customer', '')
+        period_end = data.get('current_period_end')
+        expires = datetime.utcfromtimestamp(period_end).strftime('%Y-%m-%d %H:%M:%S') if period_end else None
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE subscriptions SET pro_status='cancelled', pro_expires_at=? WHERE stripe_customer_id=?",
+            (expires, customer_id)
+        )
+        conn.commit()
+        conn.close()
+
+    return jsonify({'status': 'ok'})
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "<h1>PingBot</h1>"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
@@ -657,8 +1405,16 @@ def main():
     application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
     application.add_handler(CommandHandler('list', list_tasks))
     application.add_handler(CommandHandler('delete', delete_start))
+    application.add_handler(CommandHandler('stats', stats_cmd))
+    application.add_handler(CommandHandler('badges', badges_cmd))
+    application.add_handler(CommandHandler('upgrade', upgrade_cmd))
+    application.add_handler(CommandHandler('cancel_pro', cancel_pro_cmd))
+    application.add_handler(CommandHandler('freeze', freeze_cmd))
+    application.add_handler(CallbackQueryHandler(freeze_callback, pattern='^freeze_'))
     application.add_handler(add_conv)
     application.add_handler(CallbackQueryHandler(delete_callback, pattern='^del_'))
+    application.add_handler(CallbackQueryHandler(done_callback, pattern='^done_'))
+    application.add_handler(CallbackQueryHandler(skip_callback, pattern='^skip_'))
     
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
