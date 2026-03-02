@@ -464,6 +464,42 @@ def parse_natural_date(text, timezone_str):
         # If parsed date is in past but has year specified, it might be next year
         # Let it through and we'll check later
     
+    # Time-only input: no date keyword found, but a time is present -> default to today/tomorrow
+    date_keywords = ['tomorrow', 'today', 'next week', 'monday', 'tuesday', 'wednesday',
+                     'thursday', 'friday', 'saturday', 'sunday', 'january', 'february',
+                     'march', 'april', 'may', 'june', 'july', 'august', 'september',
+                     'october', 'november', 'december', 'in 2 days', 'in 3 days']
+    has_date_keyword = any(kw in text_lower for kw in date_keywords)
+    has_year = bool(re.search(r'\b20\d{2}\b', text_normalized))
+
+    if not has_date_keyword and not has_year and not parsed:
+        time_only_patterns = [
+            r'(\d{1,2}):(\d{2})\s*(am|pm)',
+            r'(\d{1,2})(\d{2})\s*(am|pm)',
+            r'(\d{1,2})\s*(am|pm)',
+        ]
+        for pattern in time_only_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                groups = match.groups()
+                hour = int(groups[0])
+                minute = int(groups[1]) if len(groups) > 2 and groups[1] and groups[1].isdigit() else 0
+                ampm = groups[-1]
+                if ampm == 'pm' and hour != 12:
+                    hour += 12
+                elif ampm == 'am' and hour == 12:
+                    hour = 0
+                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # If that time already passed today, schedule for tomorrow
+                if candidate <= now:
+                    candidate = candidate + timedelta(days=1)
+                return {
+                    'datetime': candidate,
+                    'date': candidate.strftime('%Y-%m-%d'),
+                    'time': candidate.strftime('%H:%M'),
+                    'is_recurring': is_recurring
+                }
+
     # Manual parsing for common patterns
     if 'tomorrow' in text_lower:
         target_date = now + timedelta(days=1)
