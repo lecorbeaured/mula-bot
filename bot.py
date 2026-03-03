@@ -1486,7 +1486,12 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timezone_str = get_user_timezone(user_id)
     local_hour = datetime.now(pytz.timezone(timezone_str)).hour
 
-    result = complete_task(user_id, task_id, local_hour=local_hour)
+    try:
+        result = complete_task(user_id, task_id, local_hour=local_hour)
+    except Exception as e:
+        logger.error(f"done_callback error: {e}")
+        await query.answer(f"Error: {e}", show_alert=True)
+        return
 
     streak_text = ""
     if result['is_new_day']:
