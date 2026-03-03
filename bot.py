@@ -717,6 +717,8 @@ def extract_task_name(text):
         r'on \w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}',
         r'(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2}(?:,?\s*\d{4})?',
         r'(?:daily|weekly|monthly)',
+        r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
+        r'\d{1,2}\s+\d{1,2}\s+\d{4}',
     ]
     
     name = text
@@ -1202,7 +1204,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg_reply(update, "No tasks! Add one with /add")
         return
     
-    msg = "📋 Your Tasks:\n\n"
+    keyboard = []
     for task in tasks:
         emoji = "🔁" if task['is_recurring'] else "☑️"
         
@@ -1211,13 +1213,20 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if task.get('days_until') == 0:
                 date_info = " TODAY"
             elif task.get('days_until') == 1:
-                date_info = " tomorrow"
+                date_info = " tmrw"
             elif task.get('days_until') and task['days_until'] > 1:
-                date_info = f" ({task['days_until']} days)"
+                date_info = f" ({task['days_until']}d)"
         
-        msg += f"{emoji}{date_info} {task['name']} at {fmt_time(task['time'])}\n"
+        label = f"{emoji}{date_info} {task['name']} at {fmt_time(task['time'])}"
+        keyboard.append([
+            InlineKeyboardButton(label, callback_data=f"noop"),
+            InlineKeyboardButton("✅", callback_data=f"done_{task['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"del_{task['id']}"),
+        ])
     
-    await msg_reply(update, msg)
+    await msg_reply(update, "📋 *Your Tasks:*", 
+                   reply_markup=InlineKeyboardMarkup(keyboard),
+                   parse_mode='Markdown')
 
 async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1794,6 +1803,7 @@ def main():
     application.add_handler(CommandHandler('freeze', freeze_cmd))
     application.add_handler(CallbackQueryHandler(freeze_callback, pattern='^freeze_'))
     application.add_handler(add_conv)
+    application.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern='^noop$'))
     application.add_handler(CallbackQueryHandler(delete_callback, pattern='^del_'))
     application.add_handler(CallbackQueryHandler(done_callback, pattern='^done_'))
     application.add_handler(CallbackQueryHandler(skip_callback, pattern='^skip_'))
