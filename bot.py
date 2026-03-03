@@ -713,11 +713,14 @@ def parse_natural_date(text, timezone_str):
 
 def extract_task_name(text):
     """Remove date/time parts to get clean task name"""
+    # Normalize first so 'noon' -> '12:00pm' etc
+    text = normalize_time(text)
     patterns = [
         r'tomorrow',
         r'today',
         r'next (monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)',
-        r'every (day|week|month|monday|tuesday|wednesday|thursday|friday)',
+        r'this (monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+        r'every (day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
         r'in \d+ days?',
         r'in \d+ hours?',
         r'in \d+ mins?(?:utes?)?',
@@ -725,12 +728,16 @@ def extract_task_name(text):
         r'at \d{1,2}:\d{2}\s*(?:am|pm)?',
         r'at \d{1,2}\s*(?:am|pm)',
         r'\d{1,2}:\d{2}\s*(?:am|pm)',
-        r'\d{1,2}\d{2}\s*(?:am|pm)',  # 245pm
+        r'\d{1,2}\d{2}\s*(?:am|pm)',
         r'on \w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}',
         r'(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2}(?:,?\s*\d{4})?',
         r'(?:daily|weekly|monthly)',
         r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
         r'\d{1,2}\s+\d{1,2}\s+\d{4}',
+        r'\bnoon\b',
+        r'\bmidnight\b',
+        r'\bam\b',
+        r'\bpm\b',
     ]
     
     name = text
