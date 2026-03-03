@@ -309,10 +309,15 @@ def get_or_create_stats(user_id, conn=None):
 
 def award_xp(user_id, xp_amount, conn):
     cursor = conn.cursor()
+    # Ensure row exists first
+    cursor.execute(
+        "INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (user_id,)
+    )
     cursor.execute(
         "UPDATE user_stats SET xp = xp + ?, tasks_completed = tasks_completed + 1 WHERE user_id = ?",
         (xp_amount, user_id)
     )
+    conn.commit()
 
 def update_streak(user_id, conn):
     """Update streak based on today's date. Returns (current_streak, is_new_day)."""
@@ -334,11 +339,15 @@ def update_streak(user_id, conn):
 
     best = max(best, streak)
     cursor.execute(
+        "INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (user_id,)
+    )
+    cursor.execute(
         """UPDATE user_stats 
            SET streak_current = ?, streak_best = ?, last_completed_date = ?
            WHERE user_id = ?""",
         (streak, best, today, user_id)
     )
+    conn.commit()
     return streak, True
 
 def check_and_award_badges(user_id, stats, conn):
@@ -485,9 +494,12 @@ def get_friendly_name(actual_tz):
     return actual_tz
 
 def normalize_time(time_str):
-    """Fix common time format issues like 245pm -> 2:45pm"""
+    """Fix common time format issues like 245pm -> 2:45pm, noon, midnight"""
     # Fix 245pm -> 2:45pm
     time_str = re.sub(r'(\d{1,2})(\d{2})(am|pm)', r'\1:\2\3', time_str, flags=re.IGNORECASE)
+    # Normalize noon/midnight
+    time_str = re.sub(r'\bnoon\b', '12:00pm', time_str, flags=re.IGNORECASE)
+    time_str = re.sub(r'\bmidnight\b', '12:00am', time_str, flags=re.IGNORECASE)
     return time_str
 
 def parse_natural_date(text, timezone_str):
@@ -599,31 +611,31 @@ def parse_natural_date(text, timezone_str):
         target_date = now + timedelta(days=2)
     elif 'in 3 days' in text_lower:
         target_date = now + timedelta(days=3)
-    elif 'next monday' in text_lower:
-        days_ahead = 0 - now.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        target_date = now + timedelta(days=days_ahead)
-    elif 'next tuesday' in text_lower:
-        days_ahead = 1 - now.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        target_date = now + timedelta(days=days_ahead)
-    elif 'next wednesday' in text_lower:
-        days_ahead = 2 - now.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        target_date = now + timedelta(days=days_ahead)
-    elif 'next thursday' in text_lower:
-        days_ahead = 3 - now.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        target_date = now + timedelta(days=days_ahead)
-    elif 'next friday' in text_lower:
-        days_ahead = 4 - now.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        target_date = now + timedelta(days=days_ahead)
+    else:
+        # Handle "this monday", "next friday", or bare "friday"
+        day_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2,
+                   'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6}
+        for day_name, day_num in day_map.items():
+            if day_name in text_lower:
+                is_next = f'next {day_name}' in text_lower
+                is_this = f'this {day_name}' in text_lower
+                days_ahead = day_num - now.weekday()
+                if is_next:
+                    # "next friday" = always the friday of NEXT week
+                    if days_ahead <= 0:
+                        days_ahead += 7
+                    if days_ahead < 7:
+                        days_ahead += 7
+                elif is_this:
+                    # "this friday" = the coming friday this week, even if today
+                    if days_ahead < 0:
+                        days_ahead += 7
+                else:
+                    # bare "friday" = nearest upcoming friday
+                    if days_ahead <= 0:
+                        days_ahead += 7
+                target_date = now + timedelta(days=days_ahead)
+                break
     
     # If we have a target date from manual parsing, extract time
     if target_date:
@@ -1260,10 +1272,12 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
     today = now.strftime("%Y-%m-%d")
 
-    # Use a 2-minute window so a bot restart never silently drops a reminder
+    # Use a 10-minute catch-up window to recover missed reminders after bot restart
     current_minute = now.strftime("%H:%M")
-    prev_minute = (now - timedelta(minutes=1)).strftime("%H:%M")
-    time_window = list({current_minute, prev_minute})
+    time_window = list({
+        (now - timedelta(minutes=i)).strftime("%H:%M")
+        for i in range(10)
+    })
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -1305,6 +1319,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
+    conn2 = sqlite3.connect(DB_FILE)
     for task in due_tasks:
         try:
             task_id, chat_id, task_name, tz, due_date, is_recurring = task
@@ -1323,8 +1338,37 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 f"🔔 {recurring_note}Reminder\n\n*{task_name}*\nYour time: {fmt_time(local_time)}",
                 reply_markup=keyboard
             )
+
+            # Reschedule recurring tasks / deactivate one-time tasks
+            cur2 = conn2.cursor()
+            if is_recurring:
+                cur2.execute("SELECT frequency, reminder_time FROM tasks WHERE id=?", (task_id,))
+                row = cur2.fetchone()
+                if row:
+                    freq, reminder_time = row
+                    old_due = datetime.strptime(due_date, '%Y-%m-%d') if due_date else datetime.utcnow()
+                    if freq == 'daily':
+                        new_due = old_due + timedelta(days=1)
+                    elif freq == 'weekly':
+                        new_due = old_due + timedelta(weeks=1)
+                    elif freq == 'monthly':
+                        month = old_due.month + 1
+                        year = old_due.year + (month - 1) // 12
+                        month = ((month - 1) % 12) + 1
+                        new_due = old_due.replace(year=year, month=month)
+                    else:
+                        new_due = old_due + timedelta(days=1)
+                    cur2.execute(
+                        "UPDATE tasks SET due_date=? WHERE id=?",
+                        (new_due.strftime('%Y-%m-%d'), task_id)
+                    )
+            else:
+                # One-time task: deactivate after firing
+                cur2.execute("UPDATE tasks SET is_active=0 WHERE id=?", (task_id,))
+            conn2.commit()
         except Exception as e:
-            logger.error(f"Failed: {e}")
+            logger.error(f"Failed to send/reschedule task {task}: {e}")
+    conn2.close()
 
 # ── PRO SUBSCRIPTION ──────────────────────────────────────────────────────────
 
@@ -1503,12 +1547,21 @@ async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     badge_text = format_badge_notifications(result['new_badges'])
     level_name = result['level'][2]
 
-    await msg_edit(query, 
+    msg_text = (
         f"✅ *Done!* +{result['xp_earned']} XP{streak_text}\n"
         f"⚡ {result['total_xp']} XP · {level_name}"
-        f"{badge_text}",
-        parse_mode='Markdown'
+        f"{badge_text}"
     )
+
+    try:
+        await msg_edit(query, msg_text, parse_mode='Markdown')
+    except Exception:
+        # If editing fails (e.g. message too old), send a new message
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=msg_text,
+            parse_mode='Markdown'
+        )
 
 async def skip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle ⏭ Skip button on reminders (no XP penalty, just dismiss)."""
@@ -1761,6 +1814,34 @@ def stripe_webhook():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
 
+async def add_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Called when /add conversation times out after 5 minutes."""
+    context.user_data.clear()
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "⏰ Add reminder timed out. Type /add to start again."
+        )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await msg_reply(update,
+        "🤖 *Mula Bot — Commands*\n\n"
+        "📝 /add — Add a reminder\n"
+        "📋 /list — View your tasks\n"
+        "❌ /delete — Delete a task\n"
+        "🌍 /timezone — Set your timezone\n"
+        "⚡ /stats — XP, level & streak\n"
+        "🏅 /badges — Your achievements\n"
+        "💎 /upgrade — Go Pro\n"
+        "🚫 /cancel — Cancel current action\n\n"
+        "*Adding reminders:*\n"
+        "• Call John tomorrow at 3pm\n"
+        "• Pay rent March 31 at 2:45pm\n"
+        "• Medicine every day at 8am\n"
+        "• Meeting in 2 hours\n"
+        "• Doctor this Friday at noon",
+        parse_mode='Markdown'
+    )
+
 async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Catch all text messages sent outside of a conversation."""
     await msg_reply(update,
@@ -1785,6 +1866,7 @@ def main():
         states={
             NATURAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_natural_input)],
             CONFIRM: [CallbackQueryHandler(confirm_callback)],
+            ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, add_timeout)],
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
@@ -1792,9 +1874,11 @@ def main():
             CommandHandler('timezone', timezone_cmd),
         ],
         allow_reentry=True,
+        conversation_timeout=300,  # 5 minutes — auto-cancel if no response
     )
     
     application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('help', help_cmd))
     application.add_handler(CommandHandler('timezone', timezone_cmd))
     application.add_handler(CallbackQueryHandler(timezone_callback, pattern='^tz_'))
     application.add_handler(CommandHandler('settz', custom_timezone_input))
