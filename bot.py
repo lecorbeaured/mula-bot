@@ -534,6 +534,15 @@ def parse_natural_date(text, timezone_str):
                 'time': parsed.strftime('%H:%M'),
                 'is_recurring': is_recurring
             }
+        # Past date with explicit year — return as-is so caller can warn the user
+        explicit_year = bool(re.search(r'\b20\d{2}\b', text_normalized))
+        if explicit_year:
+            return {
+                'datetime': parsed,
+                'date': parsed.strftime('%Y-%m-%d'),
+                'time': parsed.strftime('%H:%M'),
+                'is_recurring': is_recurring
+            }
         # If parsed date is in past but has year specified, it might be next year
         # Let it through and we'll check later
     
@@ -1739,6 +1748,18 @@ def stripe_webhook():
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
 
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch all text messages sent outside of a conversation."""
+    await msg_reply(update,
+        "💡 To add a reminder, use /add\n\n"
+        "Example: /add then type 'Call John tomorrow at 3pm'\n\n"
+        "Other commands:\n"
+        "📋 /list — view tasks\n"
+        "❌ /delete — remove a task\n"
+        "🌍 /timezone — set your city\n"
+        "⚡ /stats — XP & streak"
+    )
+
 def main():
     if not TOKEN:
         logger.error("No TOKEN!")
@@ -1777,6 +1798,7 @@ def main():
     application.add_handler(CallbackQueryHandler(done_callback, pattern='^done_'))
     application.add_handler(CallbackQueryHandler(skip_callback, pattern='^skip_'))
     
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
     application.job_queue.run_repeating(check_reminders, interval=60, first=10)
     
     logger.info("Bot started!")
