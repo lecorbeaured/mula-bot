@@ -1221,7 +1221,6 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([
             InlineKeyboardButton(label, callback_data=f"noop"),
             InlineKeyboardButton("✅", callback_data=f"done_{task['id']}"),
-            InlineKeyboardButton("🗑️", callback_data=f"del_{task['id']}"),
         ])
     
     await msg_reply(update, "📋 *Your Tasks:*", 
