@@ -992,15 +992,21 @@ async def add_smart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, task_name: str, parsed: dict):
     """Show confirmation message with task details."""
+    user_id = update.effective_user.id
+    timezone_str = get_user_timezone(user_id)
+    user_tz = pytz.timezone(timezone_str)
+    now_local = datetime.now(user_tz)
+
     date_obj = datetime.strptime(parsed['date'], '%Y-%m-%d')
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_local.strftime('%Y-%m-%d')
+    tomorrow = (now_local + timedelta(days=1)).strftime('%Y-%m-%d')
 
     if parsed['date'] == today:
         date_display = "Today"
-    elif parsed['date'] == (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'):
+    elif parsed['date'] == tomorrow:
         date_display = "Tomorrow"
     else:
-        days_until = (date_obj - datetime.now()).days
+        days_until = (date_obj - now_local.replace(tzinfo=None)).days
         date_display = f"{parsed['date']} (in {days_until} days)"
 
     recurring_text = "🔁 Recurring" if parsed['is_recurring'] else "☑️ One-time"
@@ -1285,7 +1291,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     for task in due_tasks:
         try:
             task_id, chat_id, task_name, tz, due_date, is_recurring = task
-            local_time = utc_to_local(current_time, tz)
+            local_time = utc_to_local(current_minute, tz)
             recurring_note = "🔁 " if is_recurring else ""
 
             keyboard = InlineKeyboardMarkup([
