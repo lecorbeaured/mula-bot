@@ -1767,10 +1767,12 @@ def stripe_webhook():
     import stripe as _stripe
     from flask import request, jsonify
     _stripe.api_key = STRIPE_SECRET_KEY
-    payload = request.data
+    payload = request.get_data(as_text=False)
     sig_header = request.headers.get('Stripe-Signature', '')
+    secret = STRIPE_WEBHOOK_SECRET.strip()
+    logger.info(f"Webhook received: sig={sig_header[:30]}... secret_len={len(secret)} secret_prefix={secret[:10]}")
     try:
-        event = _stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        event = _stripe.Webhook.construct_event(payload, sig_header, secret)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({'error': str(e)}), 400
